@@ -33,34 +33,34 @@ namespace gc {
                 continue;
             }
 
-            page_allocation allocation = TryAllocateOnPage(page, type.size * count, type.alignment);
+            page_allocation allocation = page.TryAllocate(type.size * count, type.alignment);
             if (!allocation.empty()) {
                 try {
                     return RegisterObject(allocation, GetOrRegisterType(type));
                 } catch (std::exception&) {
-                    RemoveAllocation(page, allocation);
+                    page.RemoveAllocation(allocation);
                 }
             }
 
             CollectOnPage(page);
-            allocation = TryAllocateOnPage(page, type.size * count, type.alignment);
+            allocation = page.TryAllocate(type.size * count, type.alignment);
 
             if (!allocation.empty()) {
                 try {
                     return RegisterObject(allocation, GetOrRegisterType(type));
                 } catch (std::exception&) {
-                    RemoveAllocation(page, allocation);
+                    page.RemoveAllocation(allocation);
                 }
             }
 
             DefragmentOnPage(page);
-            allocation = TryAllocateOnPage(page, type.size * count, type.alignment);
+            allocation = page.TryAllocate(type.size * count, type.alignment);
 
             if (!allocation.empty()) {
                 try {
                     return RegisterObject(allocation, GetOrRegisterType(type));
                 } catch (std::exception&) {
-                    RemoveAllocation(page, allocation);
+                    page.RemoveAllocation(allocation);
                 }
             }
         }
@@ -104,20 +104,20 @@ namespace gc {
         }
     }
 
-    void gc_impl::RemoveAllocation(page &page, const page_allocation &allocation) noexcept(true) {
+    void page::RemoveAllocation(const page_allocation &allocation) noexcept(true) {
         // assume rw access
         auto it = std::ranges::find(
-            page.allocations,
+            allocations,
             page::allocation{
-                static_cast<page::allocation::size_type>(reinterpret_cast<uintptr_t>(allocation.data()) - reinterpret_cast<uintptr_t>(page.memory->data())),
-                static_cast<page::allocation::size_type>(allocation.size())
+                static_cast<allocation::size_type>(reinterpret_cast<uintptr_t>(allocation.data()) - reinterpret_cast<uintptr_t>(memory->data())),
+                static_cast<allocation::size_type>(allocation.size())
             });
 
-        if (it == page.allocations.end()) {
+        if (it == allocations.end()) {
             return;
         }
 
-        page.allocations.erase(it);
+        allocations.erase(it);
     }
 
     void gc_impl::RelocateObject(
@@ -145,7 +145,7 @@ namespace gc {
         allocationToHandleLookup.erase(handle->objectAllocation.data());
     }
 
-    void gc_impl::SetField(internal_handle *obj, internal_handle **field, internal_handle *newValue) noexcept(false) {
+    void internal_handle::SetField(internal_handle **field, internal_handle *newValue) noexcept(false) {
         if (field == nullptr) {
             return;
         }
@@ -159,12 +159,12 @@ namespace gc {
 
         if (newValue != nullptr) {
             scoped_rw_lock lock(newValue->objectLock, scoped_rw_lock::mode::rw);
-            newValue->referencedBy.emplace_back(obj);
+            newValue->referencedBy.emplace_back(this);
         }
 
         if (oldValue != nullptr) {
             scoped_rw_lock lock(oldValue->objectLock, scoped_rw_lock::mode::rw);
-            auto it = std::ranges::find(oldValue->referencedBy, obj);
+            auto it = std::ranges::find(oldValue->referencedBy, this);
 
             if (it == oldValue->referencedBy.end()) {
                 throw library_bug("oldValue wasn't aware of being referenced by obj");
@@ -198,45 +198,45 @@ namespace gc {
     }
 
     // 0 attempts means try until you succeed
-    bool gc_impl::TryRoPin(internal_handle *handle, const size_t attempts) noexcept(true) {
+    bool internal_handle::TryRoPin(const size_t attempts) noexcept(true) {
         if (attempts == 0) {
-            handle->objectLock.AcquireRead();
-            ++handle->pinCount;
+            objectLock.AcquireRead();
+            ++pinCount;
             return true;
         }
 
-        auto acquired = attempts == 1 ? handle->objectLock.TryAcquireRead() : handle->objectLock.TryAcquireRead(attempts);
+        auto acquired = attempts == 1 ? objectLock.TryAcquireRead() : objectLock.TryAcquireRead(attempts);
         if (!acquired) {
             return false;
         }
 
-        ++handle->pinCount;
+        ++pinCount;
         return true;
     }
 
-    bool gc_impl::TryRwPin(internal_handle *handle, const size_t attempts) noexcept(true) {
+    bool internal_handle::TryRwPin(const size_t attempts) noexcept(true) {
         if (attempts == 0) {
-            handle->objectLock.AcquireWrite();
-            ++handle->pinCount;
+            objectLock.AcquireWrite();
+            ++pinCount;
             return true;
         }
 
-        auto acquired = attempts == 1 ? handle->objectLock.TryAcquireWrite() : handle->objectLock.TryAcquireWrite(attempts);
+        auto acquired = attempts == 1 ? objectLock.TryAcquireWrite() : objectLock.TryAcquireWrite(attempts);
         if (!acquired) {
             return false;
         }
 
-        ++handle->pinCount;
+        ++pinCount;
         return true;
     }
 
-    void gc_impl::Unpin(internal_handle *handle) noexcept(true) {
-        handle->objectLock.Release();
-        --handle->pinCount;
+    void internal_handle::Unpin() noexcept(true) {
+        objectLock.Release();
+        --pinCount;
     }
 
-    void gc_impl::PinUpgrade(internal_handle *handle) noexcept(true) {
-        handle->objectLock.Upgrade();
+    void internal_handle::PinUpgrade() noexcept(true) {
+        objectLock.Upgrade();
     }
 
     void gc_impl::CollectOnPage(page &page) noexcept(false) {
@@ -252,23 +252,23 @@ namespace gc {
             auto handle = GetHandleForObjectAllocation(page.allocations.data() + allocation.offset);
 
             // alive if acquisition fails
-            if (!TryRoPin(handle, 1)) {
+            if (!handle->TryRoPin(1)) {
                 continue; // 1 attempt should be able to determine that
             }
 
             if (IsMarkedGarbage(handle) || !TryFindRootFor(handle, id)) {
-                PinUpgrade(handle);
+                handle->PinUpgrade();
                 try {
                     // don't unpin after this: the handle is no longer valid
                     DestroyObject(page, handle);
                 } catch (std::exception&) {
-                    Unpin(handle);
+                    handle->Unpin();
                     throw;
                 }
                 --i; // destroying the object will remove the allocation entry from the page
             }
             else {
-                Unpin(handle);
+                handle->Unpin();
             }
         }
     }
@@ -301,13 +301,13 @@ namespace gc {
             const auto fieldCount = type->getFieldCount(reinterpret_cast<const void *>(obj));
             for (size_t i = 0; i < fieldCount; ++i) {
                 // better than dangling references
-                SetField(handle, type->getField(reinterpret_cast<void *>(obj), i), nullptr);
+                handle->SetField(type->getField(reinterpret_cast<void *>(obj), i), nullptr);
             }
 
             type->destructor(reinterpret_cast<void *>(obj));
         }
 
-        RemoveAllocation(page, handle->objectAllocation);
+        page.RemoveAllocation(handle->objectAllocation);
 
         objectHandles.Remove(handle);
     }
@@ -322,7 +322,7 @@ namespace gc {
         handle->markBits.SetBit(id, true);
 
         const auto found = std::ranges::any_of(handle->referencedBy,[id, this](internal_handle *referencedBy) {
-            if (!TryRoPin(referencedBy, 1)) {
+            if (!referencedBy->TryRoPin(1)) {
                 return true;
             }
 
@@ -331,7 +331,7 @@ namespace gc {
                 MarkGarbage(referencedBy); // might not be on this page, so just mark without collecting
             }
 
-            Unpin(referencedBy);
+            referencedBy->Unpin();
 
             // found a chain of references that lead to a root
             return found;
@@ -402,12 +402,12 @@ namespace gc {
         }
     }
 
-    page_allocation gc_impl::TryAllocateOnPage(page &page, const size_t size, const size_t alignment) noexcept(false) {
-        const auto begin = std::bit_cast<uintptr_t>(page.memory->data());
+    page_allocation page::TryAllocate(const size_t size, const size_t alignment) noexcept(false) {
+        const auto begin = std::bit_cast<uintptr_t>(memory->data());
         auto lastAllocationEnd = begin;
 
-        for (size_t i = 0; i < page.allocations.size(); ++i) {
-            const auto &allocation = page.allocations[i];
+        for (size_t i = 0; i < allocations.size(); ++i) {
+            const auto &allocation = allocations[i];
             const auto allocationBegin = begin + allocation.offset;
             const auto gap = allocationBegin - lastAllocationEnd;
             const auto padding = alignment - lastAllocationEnd % alignment;
@@ -417,10 +417,10 @@ namespace gc {
                     break;
                 }
 
-                page.allocations.insert(page.allocations.begin() + static_cast<ptrdiff_t>(i),
+                allocations.insert(allocations.begin() + static_cast<ptrdiff_t>(i),
                     page::allocation{
-                        static_cast<page::allocation::size_type>(allocation.offset + allocation.size + padding),
-                        static_cast<page::allocation::size_type>(size)
+                        static_cast<allocation::size_type>(allocation.offset + allocation.size + padding),
+                        static_cast<allocation::size_type>(size)
                     });
 
                 return {reinterpret_cast<std::byte *>(lastAllocationEnd + padding), size};
@@ -429,14 +429,14 @@ namespace gc {
             lastAllocationEnd = allocationBegin + allocation.size;
         }
 
-        const auto end = reinterpret_cast<uintptr_t>(page.memory->data()) + page.memory->size();
+        const auto end = reinterpret_cast<uintptr_t>(memory->data()) + memory->size();
         const auto padding = alignment - lastAllocationEnd % alignment;
         const auto gap = end - lastAllocationEnd;
 
         if (gap >= size + padding) {
-            page.allocations.emplace_back(
-                static_cast<page::allocation::size_type>(lastAllocationEnd - begin + padding),
-                static_cast<page::allocation::size_type>(size));
+            allocations.emplace_back(
+                static_cast<allocation::size_type>(lastAllocationEnd - begin + padding),
+                static_cast<allocation::size_type>(size));
 
             return {reinterpret_cast<std::byte *>(lastAllocationEnd + padding), size};
         }
@@ -448,12 +448,12 @@ namespace gc {
         page &page = NewPage(true);
         defer lockRelease ([&]{ page.allocationLock.Release(); });
 
-        page_allocation allocation = TryAllocateOnPage(page, type.size * count, type.alignment);
+        page_allocation allocation = page.TryAllocate(type.size * count, type.alignment);
         if (!allocation.empty()) {
             try {
                 return RegisterObject(allocation, GetOrRegisterType(type));
             } catch (std::exception&) {
-                RemoveAllocation(page, allocation);
+                page.RemoveAllocation(allocation);
                 throw;
             }
         }
@@ -521,7 +521,7 @@ namespace gc {
             while (!page.allocations.empty()) {
                 const auto &allocation = page.allocations.back();
                 internal_handle *handle = GetHandleForObjectAllocation(reinterpret_cast<const void *>(begin + allocation.offset));
-                TryRwPin(handle); // not just trying in this call,as misleading as it may be
+                handle->TryRwPin(); // not just trying in this call,as misleading as it may be
                 DestroyObject(page, handle);
             }
 

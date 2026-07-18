@@ -28,6 +28,7 @@ namespace gc {
     using type_index = config::object_type_index_underlying_type;
 
     using page_memory = std::array<std::byte, config::page_size>;
+    using page_allocation = std::span<std::byte>;
 
     struct page {
         page_memory *memory{nullptr};
@@ -52,9 +53,9 @@ namespace gc {
         std::pmr::vector<allocation> allocations;
 
         explicit page(std::pmr::memory_resource *allocationsBacking) : allocations(allocationsBacking) {}
+        page_allocation TryAllocate(size_t size, size_t alignment) noexcept(false);
+        void RemoveAllocation(const page_allocation &allocation) noexcept(true);
     };
-
-    using page_allocation = std::span<std::byte>;
 
     static_assert(config::gc_max_collection_thread_count <= 64, "garbage collection threads are only supported");
 
@@ -85,6 +86,12 @@ namespace gc {
         atomic_mark_bitfield markBits{0};
         rw_lock objectLock{}; // only for field/allocation modifications or for moving object during defragmentation
         atomic_bit_set<object_flags> flags;
+
+        void SetField(internal_handle **field, internal_handle *newValue) noexcept(false);
+        bool TryRoPin(size_t attempts = 0) noexcept(true);
+        bool TryRwPin(size_t attempts = 0) noexcept(true);
+        void Unpin() noexcept(true);
+        void PinUpgrade() noexcept(true);
     };
 
     struct gc_impl {
@@ -105,7 +112,6 @@ namespace gc {
 
         internal_handle *Allocate(const object_type &type, size_t count) noexcept(false);
         void DefragmentOnPage(page &page) noexcept(false);
-        static void RemoveAllocation(page &page, const page_allocation &allocation) noexcept(true);
         void RelocateObject(
             page &page,
             internal_handle *handle,
@@ -122,17 +128,11 @@ namespace gc {
             return handle->flags.HasFlag(object_flags::garbage);
         }
 
-        static void SetField(internal_handle *obj, internal_handle **field, internal_handle *newValue) noexcept(false);
-        static bool TryRoPin(internal_handle *handle, size_t attempts = 0) noexcept(true);
-        static bool TryRwPin(internal_handle *handle, size_t attempts = 0) noexcept(true);
-        static void Unpin(internal_handle *handle) noexcept(true);
-        static void PinUpgrade(internal_handle *handle) noexcept(true);
         void CollectOnPage(page &page) noexcept(false);
         void DestroyObject(page &page, internal_handle *handle) noexcept(false);
         bool TryFindRootFor(internal_handle *handle, thread_count id) noexcept(true);
         internal_handle *GetHandleForObjectAllocation(const void *objAllocation) noexcept(false);
         internal_handle *RegisterObject(page_allocation allocation, type_index type) noexcept(false);
-        static page_allocation TryAllocateOnPage(page &page, size_t size, size_t alignment) noexcept(false);
         internal_handle *TryAllocateOnNewPage(const object_type &type, size_t count) noexcept(false);
         type_index GetOrRegisterType(const object_type &type) noexcept(false);
         page &NewPage(bool acquireLock = false) noexcept(false);
