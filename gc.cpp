@@ -1,110 +1,11 @@
-#include "gca/gc.h"
+#include "gca/gc-internal.h"
 
 #include <algorithm>
-#include <list>
 #include <memory_resource>
-#include <unordered_map>
-
-#include <gca/gc-util.h>
-
-struct object_type {
-    size_t size, alignment;
-    std::type_index type;
-    gc::destructor_fn destructor;
-    gc::get_field_count_fn getFieldCount;
-    gc::get_field_fn getField;
-    gc::move_fn move;
-
-    bool operator==(const object_type &other) const noexcept {
-        return destructor == other.destructor
-        && move == other.move
-        && getFieldCount == other.getFieldCount
-        && getField == other.getField
-        && type == other.type;
-    }
-};
 
 namespace gc {
-    using type_index = config::object_type_index_underlying_type;
-}
-
-using page_memory = std::array<std::byte, gc::config::page_size>;
-
-struct page {
-    page_memory *memory{nullptr};
-    gc::mutex allocationLock{}; // allocated objects should be accessible safely without this
-    struct allocation {
-        using size_type = gc::smallest_unsigned_numeric_type_needed_for_t<gc::config::page_size>;
-        size_type offset{0};
-        size_type size{0};
-
-        [[nodiscard]] constexpr bool Equals(const allocation &other) const noexcept {
-            return offset == other.offset && size == other.size;
-        }
-
-        constexpr bool operator==(const allocation &other) const noexcept {
-            return Equals(other);
-        }
-
-        constexpr bool operator!=(const allocation &other) const noexcept {
-            return !Equals(other);
-        }
-    };
-    std::pmr::vector<allocation> allocations;
-
-    explicit page(std::pmr::memory_resource *allocationsBacking) : allocations(allocationsBacking) {}
-};
-
-using page_allocation = std::span<std::byte>;
-
-static_assert(gc::config::gc_max_collection_thread_count <= 64, "garbage collection threads are only supported");
-
-using thread_count = gc::smallest_unsigned_numeric_type_needed_for_t<gc::config::gc_max_collection_thread_count>;
-using thread_mark_bitfield_type = gc::smallest_unsigned_numeric_type_needed_for_t<1 << (gc::config::gc_max_collection_thread_count - 1)>;
-using atomic_mark_bitfield = gc::atomic_bit_set<thread_mark_bitfield_type>;
-
-enum class object_flags : uint8_t {
-    uninitialized         = 1 << 0,
-    garbage               = 1 << 1,
-    immovable             = 1 << 2,
-    initialization_failed = 1 << 3,
-};
-
-template<>
-struct gc::enum_flag_traits<object_flags> {
-    using underlying_type = uint8_t;
-    constexpr static bool is_flag = true;
-    constexpr static uint8_t all_flags = 0b1111;
-};
-
-namespace gc {
-    struct internal_handle {
-        page_allocation objectAllocation{};
-        std::pmr::vector<internal_handle*> referencedBy{};
-        std::atomic<size_t> rootHandleCount{0};
-        std::atomic<size_t> pinCount{0};
-        type_index objectType{};
-        atomic_mark_bitfield markBits{0};
-        rw_lock objectLock{}; // only for field/allocation modifications
-        atomic_bit_set<object_flags> flags;
-    };
-}
-
-struct gc_impl {
-    std::pmr::memory_resource *objectMemory = nullptr, *backingMemory = nullptr;
-    std::pmr::vector<object_type> types{};
-    gc::rw_lock typesLock{};
-    std::pmr::list<page> pages{};
-    gc::mutex pageAllocationLock{};
-    gc::rw_lock pagesLock{};
-    std::pmr::polymorphic_allocator<page_memory> pageAllocator{};
-    gc::ptr_safe_container<gc::internal_handle> objectHandles{};
-    std::pmr::unordered_map<const void*, gc::internal_handle*> allocationToHandleLookup{};
-    gc::rw_lock allocationLookupLock{}; // for both the container and the lookup
-    std::atomic<thread_count> gcCount{0};
-
-    gc_impl() : gc_impl(gc::gc_init_args{std::pmr::null_memory_resource(), std::pmr::null_memory_resource()}) {}
-    explicit gc_impl(const gc::gc_init_args &args)
+    gc_impl::gc_impl() : gc_impl(gc_init_args{std::pmr::null_memory_resource(), std::pmr::null_memory_resource()}) {}
+    gc_impl::gc_impl(const gc_init_args &args)
     : objectMemory(args.objectMemory)
     , backingMemory(args.backingMemory)
     , types(backingMemory)
@@ -113,13 +14,13 @@ struct gc_impl {
     , objectHandles(backingMemory)
     , allocationToHandleLookup(backingMemory) {}
 
-    gc::internal_handle *Allocate(const object_type &type, const size_t count) noexcept(false) {
+    internal_handle * gc_impl::Allocate(const object_type &type, const size_t count) noexcept(false) {
         // FIXME: handle large objects
 
         std::pmr::list<page>::iterator begin{}, end{};
 
         {
-            gc::scoped_rw_lock lock(pagesLock);
+            scoped_rw_lock lock(pagesLock);
             begin = pages.begin();
             end = pages.end();
         }
@@ -127,7 +28,7 @@ struct gc_impl {
         for (auto it = begin; it != end; ++it) {
             page &page = *it;
 
-            gc::scoped_mutex_lock lock(page.allocationLock, gc::scoped_mutex_lock::mode::try_only, gc::config::page_acquire_attempts);
+            scoped_mutex_lock lock(page.allocationLock, scoped_mutex_lock::mode::try_only, config::page_acquire_attempts);
             if (!lock.Acquired()) {
                 continue;
             }
@@ -135,7 +36,7 @@ struct gc_impl {
             page_allocation allocation = TryAllocateOnPage(page, type.size * count, type.alignment);
             if (!allocation.empty()) {
                 try {
-                    return RegisterObject(&page, allocation, count, GetOrRegisterType(type));
+                    return RegisterObject(allocation, GetOrRegisterType(type));
                 } catch (std::exception&) {
                     RemoveAllocation(page, allocation);
                 }
@@ -146,7 +47,7 @@ struct gc_impl {
 
             if (!allocation.empty()) {
                 try {
-                    return RegisterObject(&page, allocation, count, GetOrRegisterType(type));
+                    return RegisterObject(allocation, GetOrRegisterType(type));
                 } catch (std::exception&) {
                     RemoveAllocation(page, allocation);
                 }
@@ -157,7 +58,7 @@ struct gc_impl {
 
             if (!allocation.empty()) {
                 try {
-                    return RegisterObject(&page, allocation, count, GetOrRegisterType(type));
+                    return RegisterObject(allocation, GetOrRegisterType(type));
                 } catch (std::exception&) {
                     RemoveAllocation(page, allocation);
                 }
@@ -167,19 +68,19 @@ struct gc_impl {
         return TryAllocateOnNewPage(type, count);
     }
 
-    void DefragmentOnPage(page &page) noexcept(false) {
+    void gc_impl::DefragmentOnPage(page &page) noexcept(false) {
         // assume write access to page
         const auto begin = reinterpret_cast<uintptr_t>(page.allocations.data());
         auto lastAllocationEnd = begin;
 
         for (size_t i = 0; i < page.allocations.size(); ++i) {
             auto &allocation = page.allocations[i];
-            gc::internal_handle *handle = GetHandleForObjectAllocation(reinterpret_cast<void *>(begin + allocation.offset));
+            internal_handle *handle = GetHandleForObjectAllocation(reinterpret_cast<void *>(begin + allocation.offset));
 
             if (!handle->flags.HasFlag(object_flags::immovable)) {
                 const object_type *type = nullptr;
                 {
-                    gc::scoped_rw_lock lock(typesLock);
+                    scoped_rw_lock lock(typesLock);
                     type = &types[handle->objectType];
                 }
 
@@ -190,7 +91,7 @@ struct gc_impl {
 
                 if (lastAllocationEnd + padding + size < allocation.offset) {
                     // we have exclusive write access, so no pin could exist
-                    gc::scoped_rw_lock lock(handle->objectLock, gc::scoped_rw_lock::mode::try_rw, 1);
+                    scoped_rw_lock lock(handle->objectLock, scoped_rw_lock::mode::try_rw, 1);
                     // not gonna wait until it's released
                     if (lock.Acquired()) {
                         RelocateObject(page, handle, type, allocation, reinterpret_cast<void *>(lastAllocationEnd + padding));
@@ -203,7 +104,7 @@ struct gc_impl {
         }
     }
 
-    static void RemoveAllocation(page &page, const page_allocation &allocation) noexcept(true) {
+    void gc_impl::RemoveAllocation(page &page, const page_allocation &allocation) noexcept(true) {
         // assume rw access
         auto it = std::ranges::find(
             page.allocations,
@@ -219,15 +120,15 @@ struct gc_impl {
         page.allocations.erase(it);
     }
 
-    void RelocateObject(
+    void gc_impl::RelocateObject(
         page &page,
-        gc::internal_handle *handle,
+        internal_handle *handle,
         const object_type *type,
         page::allocation &allocation,
         void *newLocation
     ) noexcept(false) {
         // assume write access to handle
-        gc::scoped_rw_lock lock(allocationLookupLock, gc::scoped_rw_lock::mode::rw);
+        scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
         allocationToHandleLookup.insert(std::make_pair(newLocation, handle));
 
         const auto begin = reinterpret_cast<uintptr_t>(handle->objectAllocation.data());
@@ -237,44 +138,36 @@ struct gc_impl {
             obj < end;
             obj += type->size, newLoc += type->size) {
             type->move(reinterpret_cast<void *>(obj), reinterpret_cast<void*>(newLoc));
-        }
+            }
         handle->objectAllocation = { static_cast<std::byte *>(newLocation), allocation.size };
         allocation.offset = reinterpret_cast<uintptr_t>(newLocation) - reinterpret_cast<uintptr_t>(page.allocations.data());
 
         allocationToHandleLookup.erase(handle->objectAllocation.data());
     }
 
-    static constexpr void MarkGarbage(gc::internal_handle *handle) noexcept(true) {
-        handle->flags.SetFlag(object_flags::garbage, true);
-    }
-
-    static constexpr bool IsMarkedGarbage(const gc::internal_handle *handle) noexcept(true) {
-        return handle->flags.HasFlag(object_flags::garbage);
-    }
-
-    static void SetField(gc::internal_handle *obj, gc::internal_handle **field, gc::internal_handle *newValue) noexcept(false) {
+    void gc_impl::SetField(internal_handle *obj, internal_handle **field, internal_handle *newValue) noexcept(false) {
         if (field == nullptr) {
             return;
         }
 
         // assume having rw pin access to obj
-        gc::internal_handle *oldValue = *field;
+        internal_handle *oldValue = *field;
 
         if (oldValue == newValue) {
             return;
         }
 
         if (newValue != nullptr) {
-            gc::scoped_rw_lock lock(newValue->objectLock, gc::scoped_rw_lock::mode::rw);
+            scoped_rw_lock lock(newValue->objectLock, scoped_rw_lock::mode::rw);
             newValue->referencedBy.emplace_back(obj);
         }
 
         if (oldValue != nullptr) {
-            gc::scoped_rw_lock lock(oldValue->objectLock, gc::scoped_rw_lock::mode::rw);
+            scoped_rw_lock lock(oldValue->objectLock, scoped_rw_lock::mode::rw);
             auto it = std::ranges::find(oldValue->referencedBy, obj);
 
             if (it == oldValue->referencedBy.end()) {
-                throw gc::library_bug("oldValue wasn't aware of being referenced by obj");
+                throw library_bug("oldValue wasn't aware of being referenced by obj");
             }
 
             std::swap(*it, oldValue->referencedBy.back());
@@ -305,7 +198,7 @@ struct gc_impl {
     }
 
     // 0 attempts means try until you succeed
-    static bool TryRoPin(gc::internal_handle *handle, const size_t attempts = 0) noexcept(true) {
+    bool gc_impl::TryRoPin(internal_handle *handle, const size_t attempts) noexcept(true) {
         if (attempts == 0) {
             handle->objectLock.AcquireRead();
             ++handle->pinCount;
@@ -321,7 +214,7 @@ struct gc_impl {
         return true;
     }
 
-    static bool TryRwPin(gc::internal_handle *handle, const size_t attempts = 0) noexcept(true) {
+    bool gc_impl::TryRwPin(internal_handle *handle, const size_t attempts) noexcept(true) {
         if (attempts == 0) {
             handle->objectLock.AcquireWrite();
             ++handle->pinCount;
@@ -337,18 +230,18 @@ struct gc_impl {
         return true;
     }
 
-    static void Unpin(gc::internal_handle *handle) noexcept(true) {
+    void gc_impl::Unpin(internal_handle *handle) noexcept(true) {
         handle->objectLock.Release();
         --handle->pinCount;
     }
 
-    static void PinUpgrade(gc::internal_handle *handle) noexcept(true) {
+    void gc_impl::PinUpgrade(internal_handle *handle) noexcept(true) {
         handle->objectLock.Upgrade();
     }
 
-    void CollectOnPage(page &page) noexcept(false) {
+    void gc_impl::CollectOnPage(page &page) noexcept(false) {
         thread_count id;
-        while ((id = gcCount++) >= gc::config::gc_max_collection_thread_count) {
+        while ((id = gcCount++) >= config::gc_max_collection_thread_count) {
             --gcCount;
         }
 
@@ -380,24 +273,24 @@ struct gc_impl {
         }
     }
 
-    void DestroyObject(page &page, gc::internal_handle *handle) noexcept(false) {
+    void gc_impl::DestroyObject(page &page, internal_handle *handle) noexcept(false) {
         // assume rw access for both the handle and the page
 
         if (page.memory->data() > handle->objectAllocation.data()
             || page.memory->data() + page.memory->size() < handle->objectAllocation.data()) {
-            throw gc::library_bug("object not allocated on this page");
-        }
+            throw library_bug("object not allocated on this page");
+            }
 
         {
-            gc::scoped_rw_lock lock(allocationLookupLock, gc::scoped_rw_lock::mode::rw);
+            scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
             if (!allocationToHandleLookup.erase(handle->objectAllocation.data())) {
-                throw gc::library_bug("unregistered object");
+                throw library_bug("unregistered object");
             }
         }
 
         const object_type *type = nullptr;
         {
-            gc::scoped_rw_lock lock(typesLock);
+            scoped_rw_lock lock(typesLock);
             type = &types[handle->objectType];
         }
 
@@ -419,7 +312,7 @@ struct gc_impl {
         objectHandles.Remove(handle);
     }
 
-    bool TryFindRootFor(gc::internal_handle *handle, thread_count id) noexcept(true) {
+    bool gc_impl::TryFindRootFor(internal_handle *handle, thread_count id) noexcept(true) {
         // assume ro pin access to handle
         if (handle->markBits.ReadBit(id)) {
             // already tested this and already got false
@@ -428,7 +321,7 @@ struct gc_impl {
 
         handle->markBits.SetBit(id, true);
 
-        const auto found = std::ranges::any_of(handle->referencedBy,[id, this](gc::internal_handle *referencedBy) {
+        const auto found = std::ranges::any_of(handle->referencedBy,[id, this](internal_handle *referencedBy) {
             if (!TryRoPin(referencedBy, 1)) {
                 return true;
             }
@@ -457,43 +350,43 @@ struct gc_impl {
         return found;
     }
 
-    gc::internal_handle *GetHandleForObjectAllocation(const void *objAllocation) noexcept(false) {
-        gc::scoped_rw_lock lock(allocationLookupLock);
+    internal_handle *gc_impl::GetHandleForObjectAllocation(const void *objAllocation) noexcept(false) {
+        scoped_rw_lock lock(allocationLookupLock);
 
         auto it = allocationToHandleLookup.find(objAllocation);
         if (it == allocationToHandleLookup.end()) {
             // should be a library bug as this function should only be called internally
-            throw gc::library_bug("unregistered/invalid allocation");
+            throw library_bug("unregistered/invalid allocation");
         }
 
         return it->second;
     }
 
-    gc::internal_handle *RegisterObject(page *page, page_allocation allocation, size_t count, gc::type_index type) noexcept(false) {
+    internal_handle *gc_impl::RegisterObject(page_allocation allocation, const type_index type) noexcept(false) {
         std::ranges::fill(allocation, static_cast<std::byte>(0));
 
-        gc::scoped_rw_lock lock(allocationLookupLock, gc::scoped_rw_lock::mode::rw);
+        scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
 
         const auto [it, success] = allocationToHandleLookup.insert(std::make_pair(allocation.data(), nullptr));
 
         if (!success) {
-            throw gc::library_bug("dead handle remained in lookup");
+            throw library_bug("dead handle remained in lookup");
         }
 
-        gc::internal_handle *handle = nullptr;
+        internal_handle *handle = nullptr;
         try {
             handle = &objectHandles.GetNextUninitialized();
 
             std::construct_at(handle);
             handle->objectAllocation = allocation;
-            handle->referencedBy = std::pmr::vector<gc::internal_handle*>(backingMemory);
+            handle->referencedBy = std::pmr::vector<internal_handle*>(backingMemory);
             handle->objectType = type;
             handle->rootHandleCount = 1;
             handle->flags.ClearAll();
             handle->flags.SetFlag(object_flags::uninitialized, true);
 
             {
-                gc::scoped_rw_lock lock(typesLock);
+                scoped_rw_lock lock(typesLock);
                 if (types[type].move == nullptr) {
                     handle->flags.SetFlag(object_flags::immovable, true);
                 }
@@ -509,7 +402,7 @@ struct gc_impl {
         }
     }
 
-    static page_allocation TryAllocateOnPage(page &page, const size_t size, const size_t alignment) noexcept(false) {
+    page_allocation gc_impl::TryAllocateOnPage(page &page, const size_t size, const size_t alignment) noexcept(false) {
         const auto begin = std::bit_cast<uintptr_t>(page.memory->data());
         auto lastAllocationEnd = begin;
 
@@ -551,14 +444,14 @@ struct gc_impl {
         return {};
     }
 
-    gc::internal_handle *TryAllocateOnNewPage(const object_type &type, const size_t count) noexcept(false) {
+    internal_handle *gc_impl::TryAllocateOnNewPage(const object_type &type, const size_t count) noexcept(false) {
         page &page = NewPage(true);
-        gc::defer lockRelease ([&]{ page.allocationLock.Release(); });
+        defer lockRelease ([&]{ page.allocationLock.Release(); });
 
         page_allocation allocation = TryAllocateOnPage(page, type.size * count, type.alignment);
         if (!allocation.empty()) {
             try {
-                return RegisterObject(&page, allocation, count, GetOrRegisterType(type));
+                return RegisterObject(allocation, GetOrRegisterType(type));
             } catch (std::exception&) {
                 RemoveAllocation(page, allocation);
                 throw;
@@ -568,8 +461,8 @@ struct gc_impl {
         return nullptr;
     }
 
-    gc::type_index GetOrRegisterType(const object_type &type) noexcept(false) {
-        gc::scoped_rw_lock lock(typesLock);
+    type_index gc_impl::GetOrRegisterType(const object_type &type) noexcept(false) {
+        scoped_rw_lock lock(typesLock);
         auto found = std::ranges::find(types, type);
         if (found == types.end()) {
             lock.Upgrade();
@@ -582,16 +475,16 @@ struct gc_impl {
         }
 
         const auto index = std::distance(types.begin(), found);
-        if (index > std::numeric_limits<gc::type_index>::max()) {
+        if (index > std::numeric_limits<type_index>::max()) {
             throw std::out_of_range("index for type exceeds tha maximum value that the gc::type_index can hold");
         }
 
-        return static_cast<gc::type_index>(index);
+        return static_cast<type_index>(index);
     }
 
-    page &NewPage(bool acquireLock = false) noexcept(false) {
-        gc::scoped_mutex_lock allocationLock(pageAllocationLock);
-        gc::scoped_rw_lock pageContainerLock(pagesLock, gc::scoped_rw_lock::mode::rw);
+    page &gc_impl::NewPage(const bool acquireLock) noexcept(false) {
+        scoped_mutex_lock allocationLock(pageAllocationLock);
+        scoped_rw_lock pageContainerLock(pagesLock, scoped_rw_lock::mode::rw);
 
         auto &page = pages.emplace_back(backingMemory);
         try {
@@ -608,26 +501,26 @@ struct gc_impl {
         return page;
     }
 
-    void InitPage(page &page) noexcept(false) {
+    void gc_impl::InitPage(page &page) noexcept(false) {
         page.memory = pageAllocator.allocate(1);
         pageAllocator.construct(page.memory);
         page.memory->fill(static_cast<std::byte>(0));
     }
 
-    void DestroyPage(page &page) noexcept(true) {
+    void gc_impl::DestroyPage(page &page) noexcept(true) {
         // assume rw access
         page.memory->~page_memory();
         pageAllocator.deallocate(page.memory, 1);
     }
 
-    ~gc_impl() noexcept(false) {
+    gc_impl::~gc_impl() noexcept(false) {
         for (page &page : pages) {
-            gc::scoped_mutex_lock lock(page.allocationLock);
+            scoped_mutex_lock lock(page.allocationLock);
 
             const auto begin = reinterpret_cast<uintptr_t>(page.memory->data());
             while (!page.allocations.empty()) {
                 const auto &allocation = page.allocations.back();
-                gc::internal_handle *handle = GetHandleForObjectAllocation(reinterpret_cast<const void *>(begin + allocation.offset));
+                internal_handle *handle = GetHandleForObjectAllocation(reinterpret_cast<const void *>(begin + allocation.offset));
                 TryRwPin(handle); // not just trying in this call,as misleading as it may be
                 DestroyObject(page, handle);
             }
@@ -635,15 +528,13 @@ struct gc_impl {
             DestroyPage(page);
         }
     }
-};
 
-size_t initCount = 0; // TODO: maybe debug assertions for being initialized (in debug mode only)
-// don't want the constructor to run before Init is called
-// and don't want to use new/delete
-alignas(alignof(gc_impl)) std::byte data[sizeof(gc_impl)];
-gc_impl *impl = reinterpret_cast<gc_impl *>(&data[0]);
+    size_t initCount = 0; // TODO: maybe debug assertions for being initialized (in debug mode only)
+    // don't want the constructor to run before Init is called
+    // and don't want to use new/delete
+    alignas(alignof(gc_impl)) std::byte data[sizeof(gc_impl)];
+    auto impl = reinterpret_cast<gc_impl *>(&data[0]);
 
-namespace gc {
     bool Init(const gc_init_args *args) {
         if (initCount++ == 0) {
             if (args) {
@@ -668,7 +559,7 @@ namespace gc {
 
     // misleading name: each object has only 1 handle to it;
     // we are just simulating having multiple handles with different roles
-    handle_t *Copy(handle_t *src, handle_role srcRole, handle_role dstRole) {
+    handle_t *Copy(handle_t *src, const handle_role srcRole, const handle_role dstRole) {
         switch (srcRole) {
             case handle_role::unknown:
                 if (dstRole != handle_role::root) {
@@ -703,16 +594,16 @@ namespace gc {
                 [[fallthrough]];
             case handle_role::rw_pin:
                 switch (dstRole) {
-                    case handle_role::root:
+                case handle_role::root:
                         ++src->rootHandleCount;
                         break;
-                    case handle_role::ro_pin:
+                case handle_role::ro_pin:
                         [[fallthrough]];
-                    case handle_role::rw_pin:
+                case handle_role::rw_pin:
                         // cannot copy pins
                         // double free, either multiple read or only 1 write access can exist at a time, ...etc
                         throw bad_api_usage("invalid copy operation");
-                        default:
+                default:
                         break;
                 }
                 return src;
@@ -725,7 +616,7 @@ namespace gc {
         return lhs == rhs;
     }
 
-    void Destroy(handle_t *handle, handle_role role) {
+    void Destroy(handle_t *handle, const handle_role role) {
         switch (role) {
             case handle_role::ro_pin:
                 [[fallthrough]];

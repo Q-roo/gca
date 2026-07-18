@@ -22,6 +22,7 @@ target_sources(
         include/gca/gc-exceptions.h
         include/gca/gc-util.h
         include/gca/gc.h
+        include/gca/gc-internal.h
 )
 
 include(FetchContent)
