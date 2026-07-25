@@ -2,9 +2,10 @@
 
 #include <algorithm>
 #include <memory_resource>
+#include <thread>
 
 namespace gc {
-    gc_impl::gc_impl() : gc_impl(gc_init_args{std::pmr::null_memory_resource(), std::pmr::null_memory_resource()}) {}
+    gc_impl::gc_impl() noexcept : gc_impl(gc_init_args{std::pmr::null_memory_resource(), std::pmr::null_memory_resource()}) {}
     gc_impl::gc_impl(const gc_init_args &args)
     : objectMemory(args.objectMemory)
     , backingMemory(args.backingMemory)
@@ -12,56 +13,84 @@ namespace gc {
     , pages(backingMemory)
     , pageAllocator(objectMemory)
     , objectHandles(backingMemory)
-    , allocationToHandleLookup(backingMemory) {}
+    , allocationToHandleLookup(backingMemory) {
+        if (objectMemory == nullptr) {
+            throw bad_api_usage("objectMemory is nullptr (use std::pmr::null_memory_resource() instead)");
+        }
 
-    internal_handle * gc_impl::Allocate(const object_type &type, const size_t count) noexcept(false) {
+        if (backingMemory == nullptr) {
+            throw bad_api_usage("backingMemory is nullptr (use std::pmr::null_memory_resource() instead)");
+        }
+    }
+
+    internal_handle *gc_impl::Allocate(const object_type &type, const size_t count) noexcept(false) {
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onAllocation(this, type, count);
+        }
+
         // FIXME: handle large objects
+        if (type.size * count > config::page_size) {
+            throw bad_api_usage("large objects are not supported yet");
+        }
 
         std::pmr::list<page>::iterator begin{}, end{};
 
         {
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onBeforePagesQuery(this);
+            }
             scoped_rw_lock lock(pagesLock);
             begin = pages.begin();
             end = pages.end();
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onPagesQueryFinished(this, begin, end);
+            }
         }
 
         for (auto it = begin; it != end; ++it) {
             page &page = *it;
 
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onBeforePageLockAcquire(this);
+            }
             scoped_mutex_lock lock(page.allocationLock, scoped_mutex_lock::mode::try_only, config::page_acquire_attempts);
             if (!lock.Acquired()) {
                 continue;
             }
 
             page_allocation allocation = page.TryAllocate(type.size * count, type.alignment);
-            if (!allocation.empty()) {
-                try {
-                    return RegisterObject(allocation, GetOrRegisterType(type));
-                } catch (std::exception&) {
-                    page.RemoveAllocation(allocation);
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onPageAllocationAttempt(this, type.size * count, type.alignment, allocation);
+            }
+
+            if (allocation.empty()) {
+                CollectOnPage(page);
+                allocation = page.TryAllocate(type.size * count, type.alignment);
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onPageAllocationAttempt(this, type.size * count, type.alignment, allocation);
                 }
             }
 
-            CollectOnPage(page);
-            allocation = page.TryAllocate(type.size * count, type.alignment);
-
-            if (!allocation.empty()) {
-                try {
-                    return RegisterObject(allocation, GetOrRegisterType(type));
-                } catch (std::exception&) {
-                    page.RemoveAllocation(allocation);
+            if (allocation.empty()) {
+                DefragmentOnPage(page);
+                allocation = page.TryAllocate(type.size * count, type.alignment);
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onPageAllocationAttempt(this, type.size * count, type.alignment, allocation);
                 }
             }
 
-            DefragmentOnPage(page);
-            allocation = page.TryAllocate(type.size * count, type.alignment);
+            if (allocation.empty()) {
+                continue;
+            }
 
-            if (!allocation.empty()) {
-                try {
-                    return RegisterObject(allocation, GetOrRegisterType(type));
-                } catch (std::exception&) {
-                    page.RemoveAllocation(allocation);
+            try {
+                return RegisterObject(allocation, GetOrRegisterType(type));
+            } catch (...) {
+                page.RemoveAllocation(allocation);
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onObjectRegisterFailed(this, allocation);
                 }
+                throw;
             }
         }
 
@@ -69,8 +98,12 @@ namespace gc {
     }
 
     void gc_impl::DefragmentOnPage(page &page) noexcept(false) {
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onDefragmentStarted(this, page);
+        }
+
         // assume write access to page
-        const auto begin = reinterpret_cast<uintptr_t>(page.allocations.data());
+        const auto begin = reinterpret_cast<uintptr_t>(page.memory->data());
         auto lastAllocationEnd = begin;
 
         for (size_t i = 0; i < page.allocations.size(); ++i) {
@@ -80,6 +113,9 @@ namespace gc {
             if (!handle->flags.HasFlag(object_flags::immovable)) {
                 const object_type *type = nullptr;
                 {
+                    if constexpr (config::enable_debug_messages) {
+                        debugListeners.onBeforeDefragmentPageTypesROLockAcquire(this, handle);
+                    }
                     scoped_rw_lock lock(typesLock);
                     type = &types[handle->objectType];
                 }
@@ -87,20 +123,30 @@ namespace gc {
                 const auto alignment = type->alignment;
                 const auto size = type->size;
 
-                const auto padding = alignment - lastAllocationEnd % alignment;
+                const auto padding = page::GetAlignmentCorrection(lastAllocationEnd, alignment);
+                const auto potentialNewLocation = lastAllocationEnd + padding;
+                const auto gap = reinterpret_cast<uintptr_t>(handle->objectAllocation.data()) - potentialNewLocation;
 
-                if (lastAllocationEnd + padding + size < allocation.offset) {
-                    // we have exclusive write access, so no pin could exist
+                if (gap >= size) {
+                    // we have exclusive write access, so no read access that would point to the wrong address
+                    // after this could exist
+                    if constexpr (config::enable_debug_messages) {
+                        debugListeners.onBeforeDefragmentPageObjectRWLockTryAcquire(this, handle);
+                    }
                     scoped_rw_lock lock(handle->objectLock, scoped_rw_lock::mode::try_rw, 1);
                     // not gonna wait until it's released
                     if (lock.Acquired()) {
-                        RelocateObject(page, handle, type, allocation, reinterpret_cast<void *>(lastAllocationEnd + padding));
+                        RelocateObject(page, handle, type, allocation, reinterpret_cast<void *>(potentialNewLocation));
                     }
 
                 }
             }
 
             lastAllocationEnd = begin + allocation.offset + allocation.size; // allocation got modified by RelocateObject
+        }
+
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onDefragmentFinished(this, page);
         }
     }
 
@@ -127,30 +173,44 @@ namespace gc {
         page::allocation &allocation,
         void *newLocation
     ) noexcept(false) {
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeDefragmentObjectRelocate(this, handle, newLocation);
+        }
         // assume write access to handle
-        scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
-        allocationToHandleLookup.insert(std::make_pair(newLocation, handle));
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeDefragmentPageLookupRWAcquire(this, handle);
+        }
+        {
+            // we have the rw lock, so no one else should access the allocation
+            // so we can update the lookup before moving the objects
+            scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
+            allocationToHandleLookup.erase(handle->objectAllocation.data());
+            allocationToHandleLookup.insert(std::make_pair(newLocation, handle));
+        }
 
         const auto begin = reinterpret_cast<uintptr_t>(handle->objectAllocation.data());
-        const auto end = begin + handle->objectAllocation.size();
-        for (
-            auto obj = begin, newLoc = reinterpret_cast<uintptr_t>(newLocation);
-            obj < end;
-            obj += type->size, newLoc += type->size) {
-            type->move(reinterpret_cast<void *>(obj), reinterpret_cast<void*>(newLoc));
+        const auto newBegin = reinterpret_cast<uintptr_t>(newLocation);
+        const auto count = handle->objectAllocation.size() / type->size;
+        if (!handle->flags.HasFlag(object_flags::uninitialized | object_flags::initialization_failed)) {
+            for (size_t i = 0; i < count; ++i) {
+                const auto offset = i * type->size;
+                type->move(
+                    reinterpret_cast<void*>(begin + offset),
+                    reinterpret_cast<void*>(newBegin + offset)
+                );
             }
-        handle->objectAllocation = { static_cast<std::byte *>(newLocation), allocation.size };
-        allocation.offset = reinterpret_cast<uintptr_t>(newLocation) - reinterpret_cast<uintptr_t>(page.allocations.data());
+        }
 
-        allocationToHandleLookup.erase(handle->objectAllocation.data());
+        handle->objectAllocation = { static_cast<std::byte *>(newLocation), allocation.size };
+        allocation.offset = reinterpret_cast<uintptr_t>(newLocation) - reinterpret_cast<uintptr_t>(page.memory->data());
     }
 
-    void internal_handle::SetField(internal_handle **field, internal_handle *newValue) noexcept(false) {
+    void internal_handle::SetField(internal_handle **field, internal_handle *newValue, const set_field_fags flags) noexcept(false) {
         if (field == nullptr) {
             return;
         }
 
-        // assume having rw pin access to obj
+        // assume having rw access to this (the instance that SetField was called on)
         internal_handle *oldValue = *field;
 
         if (oldValue == newValue) {
@@ -158,12 +218,24 @@ namespace gc {
         }
 
         if (newValue != nullptr) {
-            scoped_rw_lock lock(newValue->objectLock, scoped_rw_lock::mode::rw);
+            // someone is trying to assign a new value to a field in the destructor
+            // setting to null is allowed because that's what we do when destroying the object
+            if (this->flags.HasFlag(object_flags::garbage)) {
+                throw bad_api_usage("cannot set the fields of garbage objects to non-null values");
+            }
+
+            const auto hasNoRWAccessToNewValue = !static_cast<bool>(flags & set_field_fags::has_rw_access_to_new_value);
+            if (hasNoRWAccessToNewValue) { newValue->objectLock.AcquireWrite(); }
+            defer release([=]{ if (hasNoRWAccessToNewValue) { newValue->objectLock.Release(); } });
             newValue->referencedBy.emplace_back(this);
         }
 
+
         if (oldValue != nullptr) {
-            scoped_rw_lock lock(oldValue->objectLock, scoped_rw_lock::mode::rw);
+            const auto hasNoRWAccessToOldValue = !static_cast<bool>(flags & set_field_fags::has_rw_access_to_old_value);
+            if (hasNoRWAccessToOldValue) { oldValue->objectLock.AcquireWrite(); }
+            defer([=]{ if (hasNoRWAccessToOldValue) { oldValue->objectLock.Release(); } });
+
             auto it = std::ranges::find(oldValue->referencedBy, this);
 
             if (it == oldValue->referencedBy.end()) {
@@ -172,6 +244,8 @@ namespace gc {
 
             std::swap(*it, oldValue->referencedBy.back());
             oldValue->referencedBy.pop_back();
+
+            oldValue->objectLock.Release();
         }
 
         *field = newValue;
@@ -180,7 +254,7 @@ namespace gc {
         // can old value become garbage when it's not supposed to?
         // no, it will be still referenced by other objects if it shouldn't become garbage
         // can new value become garbage when it is not supposed to?
-        // no, new value either comes from a root handle (whether pinned or not is irrelevant)
+        // no, new value either comes from a root handle
         // or from a field of an object that is most definitely alive,
         // since we need to be able to reach the object to access the field
 
@@ -197,84 +271,75 @@ namespace gc {
         // (the mark bit only prevents recursion, not repeating the same computation, which works for us here)
     }
 
-    // 0 attempts means try until you succeed
-    bool internal_handle::TryRoPin(const size_t attempts) noexcept(true) {
-        if (attempts == 0) {
-            objectLock.AcquireRead();
-            ++pinCount;
-            return true;
-        }
-
-        auto acquired = attempts == 1 ? objectLock.TryAcquireRead() : objectLock.TryAcquireRead(attempts);
-        if (!acquired) {
-            return false;
-        }
-
-        ++pinCount;
-        return true;
-    }
-
-    bool internal_handle::TryRwPin(const size_t attempts) noexcept(true) {
-        if (attempts == 0) {
-            objectLock.AcquireWrite();
-            ++pinCount;
-            return true;
-        }
-
-        auto acquired = attempts == 1 ? objectLock.TryAcquireWrite() : objectLock.TryAcquireWrite(attempts);
-        if (!acquired) {
-            return false;
-        }
-
-        ++pinCount;
-        return true;
-    }
-
-    void internal_handle::Unpin() noexcept(true) {
-        objectLock.Release();
-        --pinCount;
-    }
-
-    void internal_handle::PinUpgrade() noexcept(true) {
-        objectLock.Upgrade();
-    }
-
     void gc_impl::CollectOnPage(page &page) noexcept(false) {
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeCollectionStart(this, page);
+        }
+
         thread_count id;
         while ((id = gcCount++) >= config::gc_max_collection_thread_count) {
             --gcCount;
+        }
+
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onCollectionStart(this, page);
         }
 
         // assume having acquired the page mutex
         for (size_t i = 0; i < page.allocations.size(); ++i)
         {
             const auto &allocation = page.allocations[i];
-            auto handle = GetHandleForObjectAllocation(page.allocations.data() + allocation.offset);
+            auto handle = GetHandleForObjectAllocation(page.memory->data() + allocation.offset);
+
+            if (handle->rootHandleCount > 0) {
+                continue;
+            }
 
             // alive if acquisition fails
-            if (!handle->TryRoPin(1)) {
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onBeforeCollectionROLockAcquire(this, handle);
+            }
+            if (!handle->objectLock.TryAcquireRead(1)) {
                 continue; // 1 attempt should be able to determine that
             }
 
             if (IsMarkedGarbage(handle) || !TryFindRootFor(handle, id)) {
-                handle->PinUpgrade();
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onBeforeCollectionROLockUpgrade(this, handle);
+                }
+                // handle->objectLock.Upgrade(); // redundant but just to be safe
+                if (!handle->objectLock.TryUpgrade()) {
+                    // this could mean 2 things
+                    // 1. forgot to release a lock (assume that non-library code does not mess with internal handles
+                    //    directly and only uses the exposed functions to manipulate them)
+                    // 2. this object is not dead
+                    throw library_bug("unreleased lock(s) to dead object");
+                }
                 try {
-                    // don't unpin after this: the handle is no longer valid
+                    // don't release the lock after this: the handle is no longer valid
                     DestroyObject(page, handle);
-                } catch (std::exception&) {
-                    handle->Unpin();
+                } catch (...) {
+                    if constexpr (config::enable_debug_messages) {
+                        debugListeners.onObjectDestroyFailed(this, handle);
+                    }
+                    handle->objectLock.Release();
                     throw;
                 }
                 --i; // destroying the object will remove the allocation entry from the page
             }
             else {
-                handle->Unpin();
+                handle->objectLock.Release();
             }
+        }
+
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onCollectionFinished(this, page);
         }
     }
 
     void gc_impl::DestroyObject(page &page, internal_handle *handle) noexcept(false) {
         // assume rw access for both the handle and the page
+        MarkGarbage(handle); // in case, it wasn't already
 
         if (page.memory->data() > handle->objectAllocation.data()
             || page.memory->data() + page.memory->size() < handle->objectAllocation.data()) {
@@ -282,6 +347,9 @@ namespace gc {
             }
 
         {
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onBeforeDestroyObjectAllocationLookupRWLockAcquire(this, handle);
+            }
             scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
             if (!allocationToHandleLookup.erase(handle->objectAllocation.data())) {
                 throw library_bug("unregistered object");
@@ -290,40 +358,118 @@ namespace gc {
 
         const object_type *type = nullptr;
         {
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onBeforeDestroyObjectTypesROLockAcquire(this, handle);
+            }
             scoped_rw_lock lock(typesLock);
             type = &types[handle->objectType];
         }
 
-        for (auto obj = reinterpret_cast<uintptr_t>(handle->objectAllocation.data());
-            obj < reinterpret_cast<uintptr_t>(handle->objectAllocation.data() + handle->objectAllocation.size());
-            obj += type->size)
-        {
-            const auto fieldCount = type->getFieldCount(reinterpret_cast<const void *>(obj));
-            for (size_t i = 0; i < fieldCount; ++i) {
-                // better than dangling references
-                handle->SetField(type->getField(reinterpret_cast<void *>(obj), i), nullptr);
-            }
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeObjectDestroyed(this, handle);
+        }
 
-            type->destructor(reinterpret_cast<void *>(obj));
+        if (!handle->flags.HasFlag(object_flags::uninitialized))
+        {
+            const auto count = handle->objectAllocation.size() / type->size;
+            const auto begin = reinterpret_cast<uintptr_t>(handle->objectAllocation.data());
+            const auto end = begin + handle->objectAllocation.size();
+
+            for (size_t i = 0; i < count; ++i) {
+                auto* const obj = reinterpret_cast<void *>(begin + i * type->size);
+                const auto fieldCount = type->getFieldCount(obj);
+                for (size_t j = 0; j < fieldCount; ++j) {
+                    // better than dangling references
+                    // possible deadlock
+                    // we are scanning the old value of field (acquire ro access)
+                    // SetField will acquire rw access for the object of field to remove this from its references
+                    // set field waits for the ro lock to release
+                    // meanwhile, the scanning will wait for this to release the rw lock
+                    // so it can get a ro lock and scan it for possible root references
+
+                    internal_handle **field = type->getField(obj, j);
+                    if (field == nullptr) {
+                        continue;
+                    }
+
+                    internal_handle *fieldObj = *field;
+                    if (fieldObj == nullptr) {
+                        continue;
+                    }
+
+                    // solution to the deadlock: temporarily release the lock for this handle
+                    if constexpr (config::enable_debug_messages) {
+                        debugListeners.onBeforeDestroyObjectFieldOldValueRWLockAcquire(this, handle, fieldObj, j);
+                    }
+                    while (!fieldObj->objectLock.TryAcquireWrite()) {
+                        handle->objectLock.Release();
+                        std::this_thread::yield();
+                        handle->objectLock.AcquireWrite();
+                        // in case the object got reallocated
+                        // which shouldn't happen since a defragmentation can only run after the collection has finished
+                        // which is still ongoing at this point
+
+                        const auto newBegin = reinterpret_cast<uintptr_t>(handle->objectAllocation.data());
+                        const auto newEnd = begin + handle->objectAllocation.size();
+
+                        if (newBegin != begin || newEnd != end) {
+                            throw library_bug("object got relocated while being destroyed");
+                        }
+                    }
+
+                    try {
+                        handle->SetField(type->getField(obj, j), nullptr, internal_handle::set_field_fags::has_rw_access_to_old_value);
+                        fieldObj->objectLock.Release();
+                    } catch (...) {
+                        fieldObj->objectLock.Release();
+                        throw;
+                    }
+                }
+
+                type->destructor(obj);
+            }
         }
 
         page.RemoveAllocation(handle->objectAllocation);
 
         objectHandles.Remove(handle);
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onAfterObjectDestroyed(this, handle);
+        }
     }
 
     bool gc_impl::TryFindRootFor(internal_handle *handle, thread_count id) noexcept(true) {
-        // assume ro pin access to handle
+        // assume ro access to handle
         if (handle->markBits.ReadBit(id)) {
             // already tested this and already got false
             return false;
         }
 
+        // no need to find one as it is already a root
+        if (handle->rootHandleCount > 0) {
+            return true;
+        }
+
+        if (IsMarkedGarbage(handle)) {
+            return false;
+        }
+
         handle->markBits.SetBit(id, true);
 
-        const auto found = std::ranges::any_of(handle->referencedBy,[id, this](internal_handle *referencedBy) {
-            if (!referencedBy->TryRoPin(1)) {
+        const auto found = std::ranges::any_of(handle->referencedBy,[id, this, handle](internal_handle *referencedBy) {
+            if (referencedBy->rootHandleCount > 0) {
                 return true;
+            }
+
+            if (IsMarkedGarbage(referencedBy)) {
+                return false;
+            }
+
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onBeforeFindRootReferencedByROLockAcquire(this, handle, referencedBy);
+            }
+            if (!referencedBy->objectLock.TryAcquireRead(1)) {
+                return true; // just assume that the object is being used, not destroyed
             }
 
             const auto found = TryFindRootFor(referencedBy, id);
@@ -331,7 +477,7 @@ namespace gc {
                 MarkGarbage(referencedBy); // might not be on this page, so just mark without collecting
             }
 
-            referencedBy->Unpin();
+            referencedBy->objectLock.Release();
 
             // found a chain of references that lead to a root
             return found;
@@ -350,21 +496,36 @@ namespace gc {
         return found;
     }
 
-    internal_handle *gc_impl::GetHandleForObjectAllocation(const void *objAllocation) noexcept(false) {
+    internal_handle *gc_impl::TryGetHandleForObjectAllocation(const void *objAllocation) noexcept(true) {
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeAllocationToHandleLookupROLockAcquire(this, objAllocation);
+        }
         scoped_rw_lock lock(allocationLookupLock);
 
         auto it = allocationToHandleLookup.find(objAllocation);
         if (it == allocationToHandleLookup.end()) {
-            // should be a library bug as this function should only be called internally
-            throw library_bug("unregistered/invalid allocation");
+            return nullptr;
         }
 
         return it->second;
     }
 
+    internal_handle *gc_impl::GetHandleForObjectAllocation(const void *objAllocation) noexcept(false) {
+        internal_handle *handle = TryGetHandleForObjectAllocation(objAllocation);
+        if (handle == nullptr) {
+            // should be a library bug as this function should only be called internally for valid objects
+            throw library_bug("unregistered/invalid allocation");
+        }
+
+        return handle;
+    }
+
     internal_handle *gc_impl::RegisterObject(page_allocation allocation, const type_index type) noexcept(false) {
         std::ranges::fill(allocation, static_cast<std::byte>(0));
 
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeRegisterObjectLookupRWLockAcquire(this, allocation, type);
+        }
         scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
 
         const auto [it, success] = allocationToHandleLookup.insert(std::make_pair(allocation.data(), nullptr));
@@ -386,6 +547,9 @@ namespace gc {
             handle->flags.SetFlag(object_flags::uninitialized, true);
 
             {
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onBeforeRegisterObjectTypesROLockAcquire(this, allocation, type);
+                }
                 scoped_rw_lock lock(typesLock);
                 if (types[type].move == nullptr) {
                     handle->flags.SetFlag(object_flags::immovable, true);
@@ -393,9 +557,11 @@ namespace gc {
             }
 
             it->second = handle;
-
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onObjectRegistered(this, handle);
+            }
             return handle;
-        } catch (std::exception&) {
+        } catch (...) {
             allocationToHandleLookup.erase(allocation.data());
             objectHandles.Remove(handle);
             throw;
@@ -410,7 +576,7 @@ namespace gc {
             const auto &allocation = allocations[i];
             const auto allocationBegin = begin + allocation.offset;
             const auto gap = allocationBegin - lastAllocationEnd;
-            const auto padding = alignment - lastAllocationEnd % alignment;
+            const auto padding = GetAlignmentCorrection(lastAllocationEnd, alignment);
 
             if (gap >= size + padding) {
                 if (i > std::numeric_limits<ptrdiff_t>::max()) [[unlikely]] {
@@ -430,7 +596,7 @@ namespace gc {
         }
 
         const auto end = reinterpret_cast<uintptr_t>(memory->data()) + memory->size();
-        const auto padding = alignment - lastAllocationEnd % alignment;
+        const auto padding = GetAlignmentCorrection(lastAllocationEnd, alignment);
         const auto gap = end - lastAllocationEnd;
 
         if (gap >= size + padding) {
@@ -449,22 +615,37 @@ namespace gc {
         defer lockRelease ([&]{ page.allocationLock.Release(); });
 
         page_allocation allocation = page.TryAllocate(type.size * count, type.alignment);
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onPageAllocationAttempt(this, type.size * count, type.alignment, allocation);
+        }
         if (!allocation.empty()) {
             try {
                 return RegisterObject(allocation, GetOrRegisterType(type));
-            } catch (std::exception&) {
+            } catch (...) {
                 page.RemoveAllocation(allocation);
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onObjectRegisterFailed(this, allocation);
+                }
                 throw;
             }
         }
 
-        return nullptr;
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onAllocateReturningNull(this);
+        }
+        return nullptr; // should get a std::bad_alloc before getting here
     }
 
     type_index gc_impl::GetOrRegisterType(const object_type &type) noexcept(false) {
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeRegisterTypeROLockAcquire(this, type);
+        }
         scoped_rw_lock lock(typesLock);
         auto found = std::ranges::find(types, type);
         if (found == types.end()) {
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onBeforeRegisterTypeLockUpgrade(this, type);
+            }
             lock.Upgrade();
             // multiple threads might have tried to add the same type
             found = std::ranges::find(types, type);
@@ -483,13 +664,19 @@ namespace gc {
     }
 
     page &gc_impl::NewPage(const bool acquireLock) noexcept(false) {
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeNewPageAllocationLockAcquire(this);
+        }
         scoped_mutex_lock allocationLock(pageAllocationLock);
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeNewPagePagesRWLockAcquire(this);
+        }
         scoped_rw_lock pageContainerLock(pagesLock, scoped_rw_lock::mode::rw);
 
         auto &page = pages.emplace_back(backingMemory);
         try {
             InitPage(page);
-        } catch (std::exception&) {
+        } catch (...) {
             pages.pop_back();
             throw;
         }
@@ -498,22 +685,66 @@ namespace gc {
             page.allocationLock.Acquire();
         }
 
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onNewPageCreated(this, page, acquireLock);
+        }
         return page;
     }
 
     void gc_impl::InitPage(page &page) noexcept(false) {
         page.memory = pageAllocator.allocate(1);
         pageAllocator.construct(page.memory);
-        page.memory->fill(static_cast<std::byte>(0));
     }
 
     void gc_impl::DestroyPage(page &page) noexcept(true) {
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforePageDestroyed(this, page);
+        }
         // assume rw access
         page.memory->~page_memory();
         pageAllocator.deallocate(page.memory, 1);
     }
 
     gc_impl::~gc_impl() noexcept(false) {
+        // force destroying objects
+        // remove all references and set all fields to null
+        for (page &page : pages) {
+            scoped_mutex_lock lock(page.allocationLock);
+
+            const auto begin = reinterpret_cast<uintptr_t>(page.memory->data());
+            for (auto allocation : page.allocations) {
+                internal_handle *handle = GetHandleForObjectAllocation(reinterpret_cast<const void *>(begin + allocation.offset));
+
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onBeforeDestructorObjectRWLockAcquire(this, handle);
+                }
+
+                scoped_rw_lock lock(handle->objectLock, scoped_rw_lock::mode::rw);
+
+                const object_type *type = nullptr;
+                {
+                    scoped_rw_lock lock(typesLock);
+                    type = &types[handle->objectType];
+                }
+
+                const auto objectCount = handle->objectAllocation.size() / type->size;
+                const auto allocationBegin = reinterpret_cast<uintptr_t>(handle->objectAllocation.data());
+                for (size_t i = 0; i < objectCount; ++i) {
+                    auto *const obj = reinterpret_cast<void *>(allocationBegin + i * type->size);
+
+                    const auto fieldCount = type->getFieldCount(obj);
+                    for (size_t j = 0; j < fieldCount; ++j) {
+                        internal_handle **field = type->getField(obj, j);
+                        if (field != nullptr) {
+                            *field = nullptr;
+                        }
+                    }
+                }
+
+                handle->referencedBy.clear();
+            }
+        }
+
         for (page &page : pages) {
             scoped_mutex_lock lock(page.allocationLock);
 
@@ -521,7 +752,10 @@ namespace gc {
             while (!page.allocations.empty()) {
                 const auto &allocation = page.allocations.back();
                 internal_handle *handle = GetHandleForObjectAllocation(reinterpret_cast<const void *>(begin + allocation.offset));
-                handle->TryRwPin(); // not just trying in this call,as misleading as it may be
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onBeforeDestructorObjectRWLockAcquire(this, handle);
+                }
+                handle->objectLock.AcquireWrite();
                 DestroyObject(page, handle);
             }
 
@@ -549,104 +783,6 @@ namespace gc {
         return false;
     }
 
-    void Destroy() {
-        if (--initCount == 0) {
-            // NOTE: collections, allocation and defragmentation operations might still be ongoing,
-            //       and it's not my job to ensure that there aren't any
-            std::destroy_at(impl);
-        }
-    }
-
-    // misleading name: each object has only 1 handle to it;
-    // we are just simulating having multiple handles with different roles
-    handle_t *Copy(handle_t *src, const handle_role srcRole, const handle_role dstRole) {
-        switch (srcRole) {
-            case handle_role::unknown:
-                if (dstRole != handle_role::root) {
-                    throw bad_api_usage("this operation is only meant to be used for creating a root handle from a newly allocated handle");
-                }
-                if (src->rootHandleCount != 1) {
-                    throw library_bug("header should have been just initialized to have 1 root reference");
-                }
-                return src;
-            case handle_role::root:
-                [[fallthrough]];
-            case handle_role::field:
-                switch (dstRole) {
-                case handle_role::ro_pin:
-                        src->objectLock.AcquireRead();
-                        ++src->pinCount;
-                        ++src->rootHandleCount;
-                        break;
-                case handle_role::rw_pin:
-                        src->objectLock.AcquireWrite();
-                        ++src->pinCount;
-                        ++src->rootHandleCount;
-                        break;
-                case handle_role::root:
-                        ++src->rootHandleCount;
-                        break;
-                default:
-                        break;
-                }
-                return src;
-            case handle_role::ro_pin:
-                [[fallthrough]];
-            case handle_role::rw_pin:
-                switch (dstRole) {
-                case handle_role::root:
-                        ++src->rootHandleCount;
-                        break;
-                case handle_role::ro_pin:
-                        [[fallthrough]];
-                case handle_role::rw_pin:
-                        // cannot copy pins
-                        // double free, either multiple read or only 1 write access can exist at a time, ...etc
-                        throw bad_api_usage("invalid copy operation");
-                default:
-                        break;
-                }
-                return src;
-            default:
-                return src;
-        }
-    }
-
-    bool Equals(const handle_t *lhs, const handle_t *rhs) {
-        return lhs == rhs;
-    }
-
-    void Destroy(handle_t *handle, const handle_role role) {
-        switch (role) {
-            case handle_role::ro_pin:
-                [[fallthrough]];
-            case handle_role::rw_pin:
-                handle->objectLock.Release();
-                --handle->pinCount;
-                [[fallthrough]];
-            case handle_role::root:
-                // would be problem: object is alive, but has 0 reachable references (referenced by) and isn't a root
-                // but a reachable object is always in either of the 2 states:
-                // 1. is root
-                // is a field of a reachable object
-                // and (atomic) transitions between being a field and a root ensure a proper order
-                // where this invariance is not broken
-                // root -> field:
-                // gets added as a field before the root handle is destroyed
-                --handle->rootHandleCount;
-                break;
-            default:
-                break;
-        }
-    }
-    void *GetInstance(const handle_t *handle, const handle_role role) {
-        if (role != handle_role::ro_pin && role != handle_role::rw_pin) {
-            throw bad_api_usage("instance can only be accessed from pinned handles");
-        }
-
-        return handle->objectAllocation.data();
-    }
-
     void Collect(const bool defragment) {
         std::pmr::list<page>::iterator begin{}, end{};
 
@@ -665,22 +801,178 @@ namespace gc {
         }
     }
 
-    handle_t *New(
-        const size_t size,
-        const size_t alignment,
-        const size_t count,
-        const std::type_index type,
-        const destructor_fn destructor,
-        const get_field_count_fn getFieldCount,
-        const get_field_fn getField,
-        const move_fn move
-    ) {
-        return impl->Allocate(object_type{ size, alignment, type, destructor, getFieldCount, getField, move }, count);
+    void Destroy() {
+        if (--initCount == 0) {
+            // NOTE: collections, allocation and defragmentation operations might still be ongoing,
+            //       and it's not my job to ensure that there aren't any
+            std::destroy_at(impl);
+        }
     }
-    bool TryAcquireInitializeRight(handle_t *handle) {
-        return handle->flags.SetFlag(object_flags::uninitialized, false);
-    }
-    void SetInitializationFailed(handle_t *handle) {
-        handle->flags.SetFlag(object_flags::initialization_failed, true);
+    namespace internal {
+        // misleading name: each object has only 1 handle to it;
+        // we are just simulating having multiple handles with different roles
+        handle_t *Copy(handle_t *src, const handle_role srcRole, const handle_role dstRole) {
+            if (src == nullptr) {
+                return nullptr;
+            }
+
+            if (dstRole == handle_role::field) {
+                throw bad_api_usage("use SetField to set a field");
+            }
+
+            switch (srcRole) {
+                case handle_role::unknown:
+                    if (dstRole != handle_role::root) {
+                        throw bad_api_usage("this operation is only meant to be used for creating a root handle from a newly allocated handle");
+                    }
+                    if (src->rootHandleCount != 1) {
+                        throw library_bug("header should have been just initialized to have 1 root reference");
+                    }
+                    return src;
+                case handle_role::root:
+                    [[fallthrough]];
+                case handle_role::field:
+                    switch (dstRole) {
+                    case handle_role::ro_pin:
+                            src->objectLock.AcquireRead();
+                            ++src->rootHandleCount;
+                            break;
+                    case handle_role::rw_pin:
+                            src->objectLock.AcquireWrite();
+                            ++src->rootHandleCount;
+                            break;
+                    case handle_role::root:
+                            ++src->rootHandleCount;
+                            break;
+                    default:
+                            break;
+                    }
+                    return src;
+                case handle_role::ro_pin:
+                    [[fallthrough]];
+                case handle_role::rw_pin:
+                    switch (dstRole) {
+                    case handle_role::root:
+                            ++src->rootHandleCount;
+                            break;
+                    case handle_role::ro_pin:
+                            [[fallthrough]]; // for the sake of consistency
+                    case handle_role::rw_pin:
+                            // cannot copy rw pins for a variety of reasons:
+                            // double release of rw locks, either multiple read or only 1 write access can exist at a
+                            // time (so copying write accesses is invalid), ...etc
+                            throw bad_api_usage("invalid copy operation");
+                    default:
+                            break;
+                    }
+                    return src;
+                default:
+                    return src;
+            }
+        }
+
+        handle_t *SetField(handle_t *obj, handle_t **field, handle_t *newValue, const handle_role newValueRole) {
+            if (obj == nullptr) {
+                // assuming no one is calling this directly
+                throw library_bug("obj is nullptr");
+            }
+
+            // assume rw access to obj
+            // scoped_rw_lock lock(obj->objectLock, scoped_rw_lock::mode::rw);
+            auto flags = internal_handle::set_field_fags::none;
+            if (newValueRole == handle_role::rw_pin) {
+                flags |= internal_handle::set_field_fags::has_rw_access_to_new_value;
+            }
+
+            if (newValueRole == handle_role::ro_pin) {
+                // could try upgrading the lock, but this is more consistent
+                throw bad_api_usage("read-only access to newValue prevents getting read-write access to update referencedBy");
+            }
+            obj->SetField(field, newValue, flags);
+            return newValue;
+        }
+
+        bool Equals(const handle_t *lhs, const handle_t *rhs) {
+            return lhs == rhs;
+        }
+
+        void Destroy(handle_t *handle, const handle_role role) {
+            if (handle == nullptr) {
+                return;
+            }
+
+            switch (role) {
+                case handle_role::ro_pin:
+                    [[fallthrough]];
+                case handle_role::rw_pin:
+                    handle->objectLock.Release();
+                    [[fallthrough]];
+                case handle_role::root:
+                    // would be problem: object is alive, but has 0 reachable references (referenced by)
+                    // and isn't a root. But, a reachable object is always in either of the 2 states:
+                    // 1. is root
+                    // is a field of a reachable object
+                    // and (atomic) transitions between being a field and a root ensure a proper order
+                    // where this invariance is not broken
+                    // root -> field:
+                    // gets added as a field before the root handle is destroyed
+                    --handle->rootHandleCount;
+                    break;
+                default:
+                    break;
+            }
+        }
+        void *GetInstance(const handle_t *handle, const handle_role role) {
+            if (role != handle_role::ro_pin && role != handle_role::rw_pin) {
+                throw bad_api_usage("instance can only be accessed from pinned handles");
+            }
+
+            if (handle == nullptr) {
+                return nullptr;
+            }
+
+            return handle->objectAllocation.data();
+        }
+
+        size_t GetMemberCount(const handle_t *array) {
+            if (array == nullptr) {
+                return 0;
+            }
+
+            const object_type *type = nullptr;
+            {
+                scoped_rw_lock lock(impl->typesLock);
+                type = &impl->types[array->objectType];
+            }
+
+            return array->objectAllocation.size() / type->size;
+        }
+
+        handle_t *LookupObject(const void *obj) noexcept {
+            if (obj == nullptr) {
+                return nullptr;
+            }
+
+            return impl->TryGetHandleForObjectAllocation(obj);
+        }
+
+        handle_t *New(
+            const size_t size,
+            const size_t alignment,
+            const size_t count,
+            const std::type_info *type,
+            const destructor_fn destructor,
+            const get_field_count_fn getFieldCount,
+            const get_field_fn getField,
+            const move_fn move
+        ) {
+            return impl->Allocate(object_type{ size, alignment, type, destructor, getFieldCount, getField, move }, count);
+        }
+        bool TryAcquireInitializeRight(handle_t *handle) {
+            return handle->flags.SetFlag(object_flags::uninitialized, false);
+        }
+        void SetInitializationFailed(handle_t *handle) {
+            handle->flags.SetFlag(object_flags::initialization_failed, true);
+        }
     }
 }

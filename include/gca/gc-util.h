@@ -23,12 +23,6 @@ namespace gc {
     template <auto max>
     using smallest_unsigned_numeric_type_needed_for_t = smallest_unsigned_numeric_type_needed_for<max>::type;
 
-    template <class>
-    class mono_state_for_t {};
-    // use with [[no_unique_address]]
-    template<bool condition, class T>
-    using conditional_member_t = std::conditional_t<condition, T, mono_state_for_t<T>>;
-
     template<class T>
     concept enumeration = std::is_enum_v<T>;
 
@@ -51,9 +45,21 @@ namespace gc {
     }
 
     template <enum_flags T>
+    auto operator |= (T &lhs, const T rhs) noexcept {
+        using type = enum_flag_traits<T>::underlying_type;
+        return reinterpret_cast<T &>(reinterpret_cast<type &>(lhs)|=type(rhs));
+    }
+
+    template <enum_flags T>
     auto operator & (const T lhs, const T rhs) noexcept {
         using type = enum_flag_traits<T>::underlying_type;
         return T(type(lhs) & type(rhs));
+    }
+
+    template <enum_flags T>
+    auto operator &= (T &lhs, const T rhs) noexcept {
+        using type = enum_flag_traits<T>::underlying_type;
+        return reinterpret_cast<T &>(reinterpret_cast<type &>(lhs)&=type(rhs));
     }
 
     template <enum_flags T>
@@ -63,14 +69,15 @@ namespace gc {
     }
 
     template <enum_flags T>
-    auto operator ~ (const T v) noexcept {
+    auto operator ^= (T &lhs, const T rhs) noexcept {
         using type = enum_flag_traits<T>::underlying_type;
-        return T(type(v) ^ enum_flag_traits<T>::all_flags);
+        return reinterpret_cast<T &>(reinterpret_cast<type &>(lhs)^=type(rhs));
     }
 
     template <enum_flags T>
-    bool HasFlags(T v, T flags) {
-        return static_cast<bool>(v & flags);
+    auto operator ~ (const T v) noexcept {
+        using type = enum_flag_traits<T>::underlying_type;
+        return T(type(v) ^ enum_flag_traits<T>::all_flags);
     }
 
     template <class T> class atomic_bit_set {
@@ -529,10 +536,7 @@ namespace gc {
     public:
         ptr_safe_container(const node_allocator &allocator = node_allocator(),
                         const node_ptr_allocator &ptr_allocator = node_ptr_allocator())
-            : allocator(allocator), nodes(ptr_allocator)
-        {
-            nodes.push_back(AllocateNode());
-        }
+            : allocator(allocator), nodes(ptr_allocator) {}
 
         T& Insert(const T& v) {
             return GetNextWritable() = v;
