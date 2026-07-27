@@ -4,6 +4,7 @@
 #include <complex>
 #include <format>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -224,6 +225,13 @@ namespace gc {
     class rw_lock {
         using counter_type = config::rw_lock_underlying_type;
         constexpr static counter_type write_mask = 1 << (sizeof(counter_type) * CHAR_BIT - 1);
+        // g++ is not happy with this combination of keywords
+        // static inline thread_local  std::pmr::unordered_set<const rw_lock*> acquiredWriteAccessesOnThisThread{};
+        // and yet, this is fine
+        static inline std::pmr::unordered_set<const rw_lock*>& GetAcquiredWriteAccessesOnThisThread() {
+            static thread_local std::pmr::unordered_set<const rw_lock*> acquiredWriteAccessesOnThisThread{}; // assuming that every thread could become a collector thread
+            return acquiredWriteAccessesOnThisThread;
+        }
         std::atomic<counter_type> m_Lock = 0;
 
         static constexpr counter_type ClearWriteBit(const counter_type v) {
@@ -232,10 +240,18 @@ namespace gc {
 
         public:
         constexpr static counter_type max_read_access_count = write_mask;
+        [[nodiscard]] bool DoesThisThreadHaveRWAccess() const noexcept {
+            return GetAcquiredWriteAccessesOnThisThread().contains(this);
+        }
+
         bool TryAcquireWrite() noexcept {
             // no need to load since in order to get the write lock, no other locks can exist
             counter_type v = 0;
-            return m_Lock.compare_exchange_weak(v, write_mask + 1); // set it to 0b10...01 (in case read overflows)
+            auto success = m_Lock.compare_exchange_weak(v, write_mask + 1); // set it to 0b10...01 (in case read overflows)
+            if (success) {
+                GetAcquiredWriteAccessesOnThisThread().emplace(this);
+            }
+            return success;
         }
 
         bool TryAcquireWrite(const size_t attempts) noexcept {
@@ -278,7 +294,12 @@ namespace gc {
 
         bool TryUpgrade() noexcept {
             counter_type v = 1;
-            return m_Lock.compare_exchange_weak(v, write_mask + 1) || v == write_mask + 1; // already rw
+            auto success = m_Lock.compare_exchange_weak(v, write_mask + 1) || v == write_mask + 1; // already rw
+            if (success && v != write_mask + 1) {
+                // when this throws, you probably have bigger problems than the noexcept specification of this function
+                GetAcquiredWriteAccessesOnThisThread().emplace(this);
+            }
+            return success;
         }
 
         bool TryUpgrade(const size_t attempts) noexcept {
@@ -298,6 +319,15 @@ namespace gc {
                     return; // already have write access
                 }
             }
+
+            GetAcquiredWriteAccessesOnThisThread().emplace(this);
+        }
+
+        void DownGrade() noexcept {
+            counter_type v = write_mask + 1;
+            if (m_Lock.compare_exchange_weak(v, 1)) {
+                GetAcquiredWriteAccessesOnThisThread().erase(this);
+            }
         }
 
         void Release() noexcept {
@@ -313,6 +343,12 @@ namespace gc {
                 // without under-flowing
                 while (!m_Lock.compare_exchange_weak(v, v != 0 ? v - 1 : v));
             }
+
+            GetAcquiredWriteAccessesOnThisThread().erase(this);
+        }
+
+        ~rw_lock() {
+            GetAcquiredWriteAccessesOnThisThread().erase(this);
         }
     };
 

@@ -35,6 +35,8 @@ namespace gc {
         void *GetInstance(const handle_t *handle, handle_role role); // should only be called with a pin(ro/rw) role
         size_t GetMemberCount(const handle_t *array);
         handle_t *LookupObject(const void *obj) noexcept;
+        handle_t *GetOwningObject(const void *obj) noexcept;
+        handle_t *LookupObjectOrGetOwningObject(const void *obj) noexcept;
 
         handle_t *New(
             size_t size,
@@ -417,7 +419,7 @@ namespace gc {
 
         template <ptrdiff_t other_field_store_offset, uint16_t other_index>
         field& operator=(const field<other_field_store_offset, other_index, std::remove_const_t<T>> &other) requires(std::is_const_v<T>) {
-            if (this != &other) {
+            if (this != static_cast<const void *>(&other)) {
                 Set(other);
             }
 
@@ -435,7 +437,7 @@ namespace gc {
 
         template <ptrdiff_t other_field_store_offset, uint16_t other_index>
         field& operator=(field<other_field_store_offset, other_index, std::remove_const_t<T>> &&other) requires(std::is_const_v<T>) {
-            if (this != &other) {
+            if (this != static_cast<void *>(&other)) {
                 Set(other);
             }
 
@@ -490,6 +492,11 @@ namespace gc {
             handle_t *obj = internal::LookupObject(GetThisObject());
 
             if (obj == nullptr) {
+                // either unmanaged or a normal field (not gc::field) of a managed object
+                obj = internal::GetOwningObject(GetThisObject());
+            }
+
+            if (obj == nullptr) {
                 // unmanaged mode
                 handle_t *oldValue = Get();
                 if (internal::Equals(oldValue, newValue)) {
@@ -503,6 +510,7 @@ namespace gc {
             }
             else {
                 // managed mode
+                // or object owning this field is a normal field of a managed object
                 internal::SetField(obj, GetField(), newValue, newValueRole);
             }
         }
@@ -525,12 +533,13 @@ namespace gc {
         }
 
         ~field() {
-            handle_t *obj = internal::LookupObject(GetThisObject());
+            handle_t *obj = internal::LookupObjectOrGetOwningObject(GetThisObject());
             if (obj == nullptr) {
-                // managed mode
-                internal::Destroy(obj, handle_role::root);
+                // unmanaged mode
+                internal::Destroy(Get(), handle_role::root);
             }
             else {
+                // managed mode or indicrectly managed
                 internal::SetField(obj, GetField(), nullptr, handle_role::unknown);
             }
         }

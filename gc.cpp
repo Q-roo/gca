@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <memory_resource>
+#include <ranges>
 #include <thread>
 
 namespace gc {
@@ -205,7 +206,7 @@ namespace gc {
         allocation.offset = reinterpret_cast<uintptr_t>(newLocation) - reinterpret_cast<uintptr_t>(page.memory->data());
     }
 
-    void internal_handle::SetField(internal_handle **field, internal_handle *newValue, const set_field_fags flags) noexcept(false) {
+    void internal_handle::SetField(internal_handle **field, internal_handle *newValue) noexcept(false) {
         if (field == nullptr) {
             return;
         }
@@ -224,7 +225,7 @@ namespace gc {
                 throw bad_api_usage("cannot set the fields of garbage objects to non-null values");
             }
 
-            const auto hasNoRWAccessToNewValue = !static_cast<bool>(flags & set_field_fags::has_rw_access_to_new_value);
+            const auto hasNoRWAccessToNewValue = !newValue->objectLock.DoesThisThreadHaveRWAccess();
             if (hasNoRWAccessToNewValue) { newValue->objectLock.AcquireWrite(); }
             defer release([=]{ if (hasNoRWAccessToNewValue) { newValue->objectLock.Release(); } });
             newValue->referencedBy.emplace_back(this);
@@ -232,9 +233,9 @@ namespace gc {
 
 
         if (oldValue != nullptr) {
-            const auto hasNoRWAccessToOldValue = !static_cast<bool>(flags & set_field_fags::has_rw_access_to_old_value);
+            const auto hasNoRWAccessToOldValue = !oldValue->objectLock.DoesThisThreadHaveRWAccess();
             if (hasNoRWAccessToOldValue) { oldValue->objectLock.AcquireWrite(); }
-            defer([=]{ if (hasNoRWAccessToOldValue) { oldValue->objectLock.Release(); } });
+            defer release([=]{ if (hasNoRWAccessToOldValue) { oldValue->objectLock.Release(); } });
 
             auto it = std::ranges::find(oldValue->referencedBy, this);
 
@@ -418,7 +419,7 @@ namespace gc {
                     }
 
                     try {
-                        handle->SetField(type->getField(obj, j), nullptr, internal_handle::set_field_fags::has_rw_access_to_old_value);
+                        handle->SetField(type->getField(obj, j), nullptr);
                         fieldObj->objectLock.Release();
                     } catch (...) {
                         fieldObj->objectLock.Release();
@@ -877,18 +878,13 @@ namespace gc {
                 throw library_bug("obj is nullptr");
             }
 
-            // assume rw access to obj
-            // scoped_rw_lock lock(obj->objectLock, scoped_rw_lock::mode::rw);
-            auto flags = internal_handle::set_field_fags::none;
-            if (newValueRole == handle_role::rw_pin) {
-                flags |= internal_handle::set_field_fags::has_rw_access_to_new_value;
+            const auto needsUpgrade = newValueRole == handle_role::ro_pin && newValue != nullptr;
+            if (needsUpgrade) {
+                newValue->objectLock.Upgrade();
             }
+            defer downgrade([=]{ if (needsUpgrade) { newValue->objectLock.DownGrade(); } });
 
-            if (newValueRole == handle_role::ro_pin) {
-                // could try upgrading the lock, but this is more consistent
-                throw bad_api_usage("read-only access to newValue prevents getting read-write access to update referencedBy");
-            }
-            obj->SetField(field, newValue, flags);
+            obj->SetField(field, newValue);
             return newValue;
         }
 
@@ -954,6 +950,30 @@ namespace gc {
             }
 
             return impl->TryGetHandleForObjectAllocation(obj);
+        }
+
+        handle_t *GetOwningObject(const void *obj) noexcept {
+            scoped_rw_lock lock(impl->allocationLookupLock);
+            for (handle_t *handle : std::views::values(impl->allocationToHandleLookup)) {
+                if (handle->objectAllocation.data() <= obj && handle->objectAllocation.data() + handle->objectAllocation.size() >= obj) {
+                    return handle;
+                }
+            }
+
+            return nullptr;
+        }
+
+        handle_t *LookupObjectOrGetOwningObject(const void *obj) noexcept {
+            handle_t *handle = LookupObject(obj);
+
+            scoped_rw_lock lock(impl->allocationLookupLock);
+            for (handle_t *handle : std::views::values(impl->allocationToHandleLookup)) {
+                if (handle->objectAllocation.data() <= obj && handle->objectAllocation.data() + handle->objectAllocation.size() >= obj) {
+                    return handle;
+                }
+            }
+
+            return nullptr;
         }
 
         handle_t *New(

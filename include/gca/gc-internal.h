@@ -1,5 +1,7 @@
 #pragma once
 
+#include <span>
+#include <array>
 #include <list>
 #include <unordered_map>
 #include <functional>
@@ -137,28 +139,13 @@ namespace gc {
         rw_lock objectLock{}; // only for field/allocation modifications or for moving object during defragmentation
         atomic_bit_set<object_flags> flags;
 
-        enum class set_field_fags : uint8_t {
-            none                       = 0,
-            has_rw_access_to_old_value = 1 << 0, // don't acquire the rw lock again for the value stored in field
-            has_rw_access_to_new_value = 1 << 1, // don't acquire the rw lock again for newValue
-        };
-
         /**
          * @brief Assigns a new value to the field
          *
          * @param field The field to assign a new value to (can be nullptr)
          * @param newValue The new value to assign to the field (can be nullptr)
-         * @param flags Additional arguments to modify the behaviour of the call
-         * @note assumes not having rw access to the old value of the field unless @p hasRWAccessToOldValue is set to true
          */
-        void SetField(internal_handle **field, internal_handle *newValue, set_field_fags flags = set_field_fags::none) noexcept(false);
-    };
-
-    template <>
-    struct enum_flag_traits<internal_handle::set_field_fags> {
-        using underlying_type = uint8_t;
-        constexpr static bool is_flag = true;
-        constexpr static uint8_t all_flags = 0b11;
+        void SetField(internal_handle **field, internal_handle *newValue) noexcept(false);
     };
 
     struct gc_impl;

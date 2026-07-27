@@ -1,6 +1,5 @@
 #include <memory_resource>
 #include <cpuid.h>
-
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
@@ -24,6 +23,55 @@
  * - memory safety
  * - polymorphism
  */
+
+// Source - https://stackoverflow.com/a/71009896
+// Posted by Marek R, modified by community. See post 'Timeline' for change history
+// Retrieved 2026-07-21, License - CC BY-SA 4.0
+
+class TerminateOnDeadlockGuard final
+{
+public:
+    using Clock = std::chrono::system_clock;
+    using Duration = Clock::duration;
+
+    explicit TerminateOnDeadlockGuard(Duration timeout = std::chrono::seconds{30});
+
+    ~TerminateOnDeadlockGuard();
+
+private:
+    void waitForCompletion();
+
+private:
+    const Duration m_timeout;
+    std::mutex m_mutex;
+    std::condition_variable m_wasCompleted;
+    std::condition_variable m_guardStarted;
+    std::thread m_guardThread;
+};
+//---------
+TerminateOnDeadlockGuard::TerminateOnDeadlockGuard(Duration timeout) : m_timeout{timeout}
+{
+    m_guardThread = std::thread(&TerminateOnDeadlockGuard::waitForCompletion, this);
+    std::unique_lock lock{m_mutex};
+    m_guardStarted.wait(lock);
+}
+
+TerminateOnDeadlockGuard::~TerminateOnDeadlockGuard()
+{
+    m_wasCompleted.notify_one();
+    m_guardThread.join();
+}
+
+void TerminateOnDeadlockGuard::waitForCompletion()
+{
+    std::unique_lock lock{m_mutex};
+    m_guardStarted.notify_one();
+    if (std::cv_status::timeout == m_wasCompleted.wait_for(lock, m_timeout))
+    {
+        std::cerr << "Test timeout!!!" << std::endl;
+        std::exit(-1); // you can use `abort` here to create crash log.
+    }
+}
 
 template <typename T>
 std::string demangled_type_name() {
@@ -647,6 +695,43 @@ TEST(GC_utility__rw_lock, try_access_acquisitions_do_not_hang) {
     }, testing::ExitedWithCode(1), "");
 }
 
+TEST(GC_utility__rw_lock, DoesThisThreadHaveRWAccess_correctness) {
+    TerminateOnDeadlockGuard guard;
+    gc::rw_lock lock;
+    EXPECT_FALSE(lock.DoesThisThreadHaveRWAccess());
+    lock.AcquireRead();
+    EXPECT_FALSE(lock.DoesThisThreadHaveRWAccess());
+    lock.Upgrade();
+    EXPECT_TRUE(lock.DoesThisThreadHaveRWAccess());
+    lock.Release();
+    EXPECT_FALSE(lock.DoesThisThreadHaveRWAccess());
+    lock.AcquireWrite();
+    EXPECT_TRUE(lock.DoesThisThreadHaveRWAccess());
+    auto hasRWAccessOnOtherThread = false;
+    std::thread([&] {
+        hasRWAccessOnOtherThread = lock.DoesThisThreadHaveRWAccess();
+    }).join();
+    EXPECT_FALSE(hasRWAccessOnOtherThread);
+    lock.Release();
+    EXPECT_FALSE(lock.DoesThisThreadHaveRWAccess());
+}
+
+TEST(GC_utility__rw_lock, Downgrade_degrades_write_access_to_a_single_read_access) {
+    TerminateOnDeadlockGuard guard;
+    {
+        gc::rw_lock lock;
+        lock.AcquireWrite();
+        lock.DownGrade();
+        lock.Upgrade();
+    }
+    {
+        gc::rw_lock lock;
+        lock.AcquireWrite();
+        lock.DownGrade();
+        lock.AcquireRead();
+    }
+}
+
 TEST(GC_utility__scoped_rw_lock, unlocks_after_going_out_of_scope) {
     EXPECT_EXIT({
         std::atomic done = false;
@@ -1228,55 +1313,6 @@ TEST(GC_collecting_allocator__gc_impl, Collect_collects_dead_objects_that_are_no
     EXPECT_TRUE(hFieldTestCollected);
 }
 
-// Source - https://stackoverflow.com/a/71009896
-// Posted by Marek R, modified by community. See post 'Timeline' for change history
-// Retrieved 2026-07-21, License - CC BY-SA 4.0
-
-class TerminateOnDeadlockGuard final
-{
-public:
-    using Clock = std::chrono::system_clock;
-    using Duration = Clock::duration;
-
-    explicit TerminateOnDeadlockGuard(Duration timeout = std::chrono::seconds{30});
-
-    ~TerminateOnDeadlockGuard();
-
-private:
-    void waitForCompletion();
-
-private:
-    const Duration m_timeout;
-    std::mutex m_mutex;
-    std::condition_variable m_wasCompleted;
-    std::condition_variable m_guardStarted;
-    std::thread m_guardThread;
-};
-//---------
-TerminateOnDeadlockGuard::TerminateOnDeadlockGuard(Duration timeout) : m_timeout{timeout}
-{
-    m_guardThread = std::thread(&TerminateOnDeadlockGuard::waitForCompletion, this);
-    std::unique_lock lock{m_mutex};
-    m_guardStarted.wait(lock);
-}
-
-TerminateOnDeadlockGuard::~TerminateOnDeadlockGuard()
-{
-    m_wasCompleted.notify_one();
-    m_guardThread.join();
-}
-
-void TerminateOnDeadlockGuard::waitForCompletion()
-{
-    std::unique_lock lock{m_mutex};
-    m_guardStarted.notify_one();
-    if (std::cv_status::timeout == m_wasCompleted.wait_for(lock, m_timeout))
-    {
-        std::cerr << "Test timeout!!!" << std::endl;
-        std::exit(-1); // you can use `abort` here to create crash log.
-    }
-}
-
 TEST(GC_collecting_allocator__gc_impl, scanning_a_field_of_an_object_being_destroyed_wont_cause_a_deadlock) {
     EXPECT_EXIT({
         TerminateOnDeadlockGuard guard{};
@@ -1661,8 +1697,9 @@ TEST(GC_assumption, ptr_is_64_bits) {
 }
 
 TEST(GC_assumption, virtual_address_size_is_48) {
+    constexpr unsigned int leaf = 0x80000008;
     unsigned int eax, ebx, ecx, edx;
-    ASSERT_NE(__get_cpuid(0x80000008, &eax, &ebx, &ecx, &edx), 0) << "cpu not supported";
+    ASSERT_NE(__get_cpuid(leaf, &eax, &ebx, &ecx, &edx), 0) << "cpu not supported";
     const auto addressBits = eax & 0x000000FF;
     EXPECT_EQ(addressBits, 48);
 }
@@ -1747,9 +1784,9 @@ TEST(GC_collecting_allocator__public_API, compiles) {
     gc::root_handle<ClassB> h0 = gc::New<ClassB>(gc::New<ClassA>());
     gc::root_handle<ClassB> h1 = gc::New<ClassB>(gc::ROPin(h0)->a);
     gc::root_handle<ClassB> h2 = gc::New<ClassB>(gc::RWPin(h0)->a);
-    EXPECT_THROW(gc::root_handle<ClassB> h3 = gc::New<ClassB>(gc::ROPin(gc::ROPin(h0)->a)), gc::bad_api_usage);
+    gc::root_handle<ClassB> h3 = gc::New<ClassB>(gc::ROPin(gc::ROPin(h0)->a));
     gc::root_handle<ClassB> h4 = gc::New<ClassB>(gc::RWPin(gc::ROPin(h0)->a));
-    EXPECT_THROW(gc::root_handle<ClassB> h5 = gc::New<ClassB>(gc::ROPin(gc::RWPin(h0)->a)), gc::bad_api_usage);
+    gc::root_handle<ClassB> h5 = gc::New<ClassB>(gc::ROPin(gc::RWPin(h0)->a));
     gc::root_handle<ClassB> h6 = gc::New<ClassB>(gc::RWPin(gc::RWPin(h0)->a));
     gc::root_handle<ClassB> h7{nullptr};
     gc::root_handle<ClassB> h8{gc::null_handle};
@@ -1856,6 +1893,175 @@ TEST(GC_collecting_allocator__public_API, move_does_not_break_invariance) {
     auto h2 = std::move(h);
     EXPECT_EQ(h2.handle->rootHandleCount, 1);
     EXPECT_FALSE(gc::ROPin(h2).Get()->a.IsNull());
+}
+
+class ClassE;
+
+// indirectly managed
+class ClassD {
+    gc::field_store<1> fields{};
+    public:
+    [[no_unique_address]]gc::field<0, 0, ClassE> field;
+    ClassD(const gc::root_handle<ClassE> &value) : field{value} {}
+};
+
+class ClassE {
+    uint64_t _{};
+    ClassD d{gc::null_handle};
+public:
+    void Set(const gc::root_handle<ClassE> &value) {
+        d = ClassD{value};
+    }
+};
+
+class ClassH;
+
+// doubly indirectly managed
+class ClassF {
+    gc::field_store<1> fields{};
+public:
+    [[no_unique_address]]gc::field<0, 0, ClassH> field;
+    ClassF(const gc::root_handle<ClassH> &value) : field{value} {}
+};
+
+class ClassG {
+    uint64_t _{};
+    ClassF f{gc::null_handle};
+public:
+    void Set(const gc::root_handle<ClassH> &value) {
+        f = ClassF{value};
+    }
+};
+
+class ClassH {
+    uint64_t _{};
+public:
+    ClassG g{};
+};
+
+template <> struct gc::gc_object_traits<ClassH> {
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 0; };
+    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return nullptr; };
+    static constexpr move_fn move = nullptr; // don't care for these tests
+    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassH *>(obj)); };
+    static constexpr bool supported = true;
+};
+
+template <> struct gc::gc_object_traits<ClassF> {
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 0; };
+    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return nullptr; };
+    static constexpr move_fn move = nullptr; // don't care for these tests
+    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassF *>(obj)); };
+    static constexpr bool supported = true;
+};
+
+template <> struct gc::gc_object_traits<ClassE> {
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 0; };
+    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return nullptr; };
+    static constexpr move_fn move = nullptr; // don't care for these tests
+    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassE *>(obj)); };
+    static constexpr bool supported = true;
+};
+
+template <> struct gc::gc_object_traits<ClassD> {
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 1; };
+    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return idx == 0 ? static_cast<ClassD *>(obj)->field.GetField() : nullptr; };
+    static constexpr move_fn move = nullptr; // don't care
+    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassD *>(obj)); };
+    static constexpr bool supported = true;
+};
+
+namespace gc {
+    extern gc_impl *impl;
+}
+TEST(GC_collecting_allocator__public_API, non_gc_allocated_member_does_not_cause_circular_references) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init({std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    {
+        auto h = gc::New<ClassE>();
+        gc::RWPin(h)->Set(h);
+    }
+
+    gc::Collect();
+    EXPECT_EQ(gc::impl->pages.front().allocations.size(), 0);
+
+    {
+        auto h = gc::New<ClassH>();
+        gc::RWPin(h)->g.Set(h);
+    }
+
+    gc::Collect();
+    EXPECT_EQ(gc::impl->pages.front().allocations.size(), 0);
+}
+
+TEST(GC_collecting_allocator__public_API, field_assignment_from_another_field_does_not_break_invariance_on_copy) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init({std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    gc::internal_handle *h1 = nullptr, *h2 = nullptr;
+
+    {
+        ClassG g;
+        {
+            auto h = gc::New<ClassH>();
+            h1 = h.handle;
+            gc::RWPin(h)->g.Set(h);
+            g = gc::ROPin(h)->g;
+        }
+
+        gc::Collect();
+        EXPECT_EQ(gc::impl->pages.front().allocations.size(), 1);
+        EXPECT_FALSE(h1->referencedBy.empty()) << "h.g no longer references h after copy";
+        EXPECT_EQ(h1->rootHandleCount, 1);
+
+        {
+            auto h = gc::New<ClassH>();
+            h2 = h.handle;
+            gc::RWPin(h)->g = g;
+            EXPECT_FALSE(h1->referencedBy.empty()) << "h1 should only be referenced by g, which should behave as a root";
+            EXPECT_EQ(h1->referencedBy.size(), 2) << "should be referenced by itself and h2";
+            EXPECT_EQ(h2->referencedBy.size(), 0);
+            EXPECT_EQ(h2->rootHandleCount, 1);
+        }
+    }
+
+    gc::Collect();
+    EXPECT_EQ(gc::impl->pages.front().allocations.size(), 0);
+}
+
+TEST(GC_collecting_allocator__public_API, field_assignment_from_another_field_does_not_break_invariance_on_move) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init({std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    gc::internal_handle *h1 = nullptr;
+    {
+        ClassG g;
+        {
+            auto h = gc::New<ClassH>();
+            h1 = h.handle;
+            gc::RWPin(h)->g.Set(h);
+            g = std::move(gc::RWPin(h)->g);
+        }
+
+        gc::Collect();
+        EXPECT_EQ(gc::impl->pages.front().allocations.size(), 1);
+        EXPECT_TRUE(h1->referencedBy.empty()) << "h.g not got copied, not moved";
+        EXPECT_EQ(h1->rootHandleCount, 1);
+
+        {
+            auto h = gc::New<ClassH>();
+            gc::RWPin(h)->g = std::move(g);
+            EXPECT_EQ(h1->referencedBy.size(), 1);
+            EXPECT_EQ(h1->rootHandleCount, 0);
+        }
+    }
+
+    gc::Collect();
+    EXPECT_EQ(gc::impl->pages.front().allocations.size(), 0);
 }
 
 int main(int argc, char **argv) {
