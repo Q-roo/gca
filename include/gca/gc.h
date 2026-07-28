@@ -7,11 +7,22 @@
 
 namespace gc {
     typedef struct internal_handle handle_t;
+    typedef struct gc_allocator allocator_handle_t;
     enum class handle_role { unknown, root, field, ro_pin, rw_pin }; // unknown is to create a root handle internally
 
+    allocator_handle_t *GetNullAllocator();
+    allocator_handle_t *GetDefaultAllocator();
+
     struct gc_init_args {
-        std::pmr::memory_resource *objectMemory, *backingMemory;
+        allocator_handle_t *allocator = GetNullAllocator();
+        gc_init_args() noexcept = default;
+        explicit gc_init_args(allocator_handle_t *allocator) : allocator(allocator) {
+            if (allocator == nullptr) {
+                throw bad_api_usage("allocator cannot be nullptr (use GetNullAllocatorInstead)");
+            }
+        }
     };
+
 
     bool Init(const gc_init_args *args /* can be nullptr */ );
     inline bool Init(const gc_init_args& args) { return Init(&args);}

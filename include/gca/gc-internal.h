@@ -77,7 +77,7 @@ namespace gc {
             return correction != 0 ? alignment - correction : 0;
         }
 
-        explicit page(std::pmr::memory_resource *allocationsBacking) : allocations(allocationsBacking) {}
+        explicit page(std::pmr::vector<allocation> &&allocations) : allocations(std::move(allocations)) { }
 
         /**
          * @biref Try allocating on this page
@@ -234,8 +234,19 @@ namespace gc {
         };
     }
 
+    struct gc_allocator {
+        virtual std::pmr::vector<object_type> CreateTypesVector() = 0;
+        virtual std::pmr::list<page> CreatePagesList() = 0;
+        virtual std::pmr::polymorphic_allocator<page_memory> CreatePageMemoryAllocator() = 0;
+        virtual ptr_safe_container<internal_handle> CreateObjectHandlesContainer() = 0;
+        virtual std::pmr::unordered_map<const void*, internal_handle*> CreateAllocationToHandleLookup() = 0;
+        virtual std::pmr::vector<page::allocation> CreatePageAllocationsVectorForPage() = 0;
+        virtual std::pmr::vector<internal_handle*> CreateReferencedByVectorForHandle() = 0;
+        virtual ~gc_allocator() = default;
+    };
+
     struct gc_impl {
-        std::pmr::memory_resource *objectMemory = nullptr, *backingMemory = nullptr;
+        gc_allocator *allocator = nullptr;
         std::pmr::vector<object_type> types{};
         rw_lock typesLock{};
         std::pmr::list<page> pages{};

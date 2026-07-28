@@ -1065,7 +1065,7 @@ constexpr gc::object_type default_gc_object_type_v = default_gc_object_type<T>::
 TEST(GC_collecting_allocator, this_should_work) { // temporary test
     bool success = false;
     gc::root_handle<int> handle = gc::null_handle;
-    EXPECT_NO_THROW(success = gc::Init(gc::gc_init_args{std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    EXPECT_NO_THROW(success = gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
     ASSERT_TRUE(success);
     EXPECT_NO_THROW(handle = gc::New<int>());
     EXPECT_NE(handle, gc::null_handle);
@@ -1083,7 +1083,7 @@ TEST(GC_collecting_allocator__page, GetAlignmentCorrection_is_correct) {
 }
 
 TEST(GC_collecting_allocator__page, allocation_strategy_allocations_are_incrementing) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
 
@@ -1097,7 +1097,7 @@ TEST(GC_collecting_allocator__page, allocation_strategy_allocations_are_incremen
 }
 
 TEST(GC_collecting_allocator__page, allocation_strategy_respects_alignment) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
 
@@ -1112,7 +1112,7 @@ TEST(GC_collecting_allocator__page, allocation_strategy_respects_alignment) {
 }
 
 TEST(GC_collecting_allocator__page, allocation_strategy_does_not_waste_space) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
 
@@ -1129,7 +1129,7 @@ TEST(GC_collecting_allocator__page, allocation_strategy_does_not_waste_space) {
 }
 
 TEST(GC_collecting_allocator__page, memory_is_aligned_to_page_alignment) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
 
@@ -1137,7 +1137,7 @@ TEST(GC_collecting_allocator__page, memory_is_aligned_to_page_alignment) {
 }
 
 TEST(GC_collecting_allocator__page, memory_is_zeroed_out) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
 
@@ -1145,7 +1145,7 @@ TEST(GC_collecting_allocator__page, memory_is_zeroed_out) {
 }
 
 TEST(GC_collecting_allocator__page, allocation_strategy_can_handle_page_size_allocations) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
 
@@ -1154,14 +1154,14 @@ TEST(GC_collecting_allocator__page, allocation_strategy_can_handle_page_size_all
 }
 
 TEST(GC_collecting_allocator__page, allocation_strategy_gracefully_fails_large_allocations) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
     EXPECT_TRUE(page.TryAllocate(gc::config::page_size + 1, 1).empty());
 }
 
 TEST(GC_collecting_allocator__page, RemoveAllocation_removes_valid_allocation) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
 
@@ -1173,7 +1173,7 @@ TEST(GC_collecting_allocator__page, RemoveAllocation_removes_valid_allocation) {
 }
 
 TEST(GC_collecting_allocator__page, RemoveAllocation_does_not_remove_invalid_allocation) {
-    gc::page page{std::pmr::get_default_resource()};
+    gc::page page{std::pmr::vector<gc::page::allocation>(std::pmr::get_default_resource())};
     page.memory = new gc::page_memory;
     gc::defer d([&]{delete page.memory;});
 
@@ -1189,13 +1189,11 @@ TEST(GC_collecting_allocator__page, RemoveAllocation_does_not_remove_invalid_all
 }
 
 TEST(GC_collecting_allocator__gc_impl, constructor_does_not_allocate) {
-    EXPECT_NO_THROW(gc::gc_impl({std::pmr::null_memory_resource(), std::pmr::null_memory_resource()}));
+    EXPECT_NO_THROW(gc::gc_impl(gc::gc_init_args{gc::GetNullAllocator()}));
 }
 
 TEST(GC_collecting_allocator__gc_impl, constructor_does_not_accept_null_memory_resource_pointer) {
-    EXPECT_THROW(gc::gc_impl({std::pmr::get_default_resource(), nullptr}), gc::bad_api_usage);
-    EXPECT_THROW(gc::gc_impl({nullptr, std::pmr::get_default_resource()}), gc::bad_api_usage);
-    EXPECT_THROW(gc::gc_impl({nullptr, nullptr}), gc::bad_api_usage);
+    EXPECT_THROW(gc::gc_impl(gc::gc_init_args{nullptr}), gc::bad_api_usage);
 }
 
 TEST(GC_collecting_allocator__gc_impl, default_constructor_does_not_throw) {
@@ -1207,19 +1205,19 @@ TEST(GC_collecting_allocator__gc_impl, default_constructor_cannot_allocate) {
 }
 
 TEST(GC_collecting_allocator__gc_impl, Allocate_count_allocations_are_sequential) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     auto handle = GC.Allocate(default_gc_object_type_v<int>, 10);
     EXPECT_EQ(handle->objectAllocation.size(), sizeof(int) * 10);
 }
 
 TEST(GC_collecting_allocator__gc_impl, Allocate_allocated_handles_count_as_root_handles) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     auto handle = GC.Allocate(default_gc_object_type_v<int>, 10);
     EXPECT_EQ(handle->rootHandleCount, 1);
 }
 
 TEST(GC_collecting_allocator__gc_impl, Allocate_triggers_collection_when_page_is_full) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     auto collected = false;
     GC.debugListeners.onBeforeCollectionStart = [&](const gc::debug::callback_data&, gc::page&) {collected = true;};
     GC.Allocate(default_gc_object_type_v<std::byte>, gc::config::page_size);
@@ -1229,7 +1227,7 @@ TEST(GC_collecting_allocator__gc_impl, Allocate_triggers_collection_when_page_is
 }
 
 TEST(GC_collecting_allocator__gc_impl, Collect_collects_dead_objects_that_are_not_roots) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     auto collected = false;
     auto handleCollected = false;
     GC.debugListeners.onBeforeCollectionStart = [&](const gc::debug::callback_data&, gc::page&) {collected = true;};
@@ -1259,7 +1257,7 @@ constexpr gc::object_type field_test_type = {
 };
 
 TEST(GC_collecting_allocator__gc_impl, Collect_does_not_collect_alive_root_objects) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     auto collected = false;
     auto handleCollected = false;
     GC.debugListeners.onBeforeCollectionStart = [&](const gc::debug::callback_data&, gc::page&) {collected = true;};
@@ -1272,7 +1270,7 @@ TEST(GC_collecting_allocator__gc_impl, Collect_does_not_collect_alive_root_objec
 }
 
 TEST(GC_collecting_allocator__gc_impl, Collect_does_not_collect_reachable_non_root_objects) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     auto collected = false;
     auto hIntCollected = false;
     GC.debugListeners.onBeforeCollectionStart = [&](const gc::debug::callback_data&, gc::page&) {collected = true;};
@@ -1288,7 +1286,7 @@ TEST(GC_collecting_allocator__gc_impl, Collect_does_not_collect_reachable_non_ro
 }
 
 TEST(GC_collecting_allocator__gc_impl, Collect_collects_dead_objects_that_are_not_roots_and_not_fields_of_any_reachable_objects_but_are_fields_of_dead_objects) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     auto collected = false;
     auto hIntCollected = false;
     auto hFieldTestCollected = false;
@@ -1317,7 +1315,7 @@ TEST(GC_collecting_allocator__gc_impl, scanning_a_field_of_an_object_being_destr
     EXPECT_EXIT({
         TerminateOnDeadlockGuard guard{};
         {
-            gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+            gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
             auto hFieldTest = GC.Allocate(field_test_type, 1);
             auto hInt = GC.TryAllocateOnNewPage(default_gc_object_type_v<int>, 1);
             auto hFieldTestCollected = false;
@@ -1355,7 +1353,7 @@ TEST(GC_collecting_allocator__gc_impl, scanning_a_field_of_an_object_being_destr
 
 TEST(GC_collecting_allocator__gc_impl, DestroyObject_will_not_destroy_uninitialized_objects) {
     static size_t destructionCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1373,7 +1371,7 @@ TEST(GC_collecting_allocator__gc_impl, DestroyObject_will_not_destroy_uninitiali
 }
 
 TEST(GC_collecting_allocator__gc_impl, DestroyObject_sitll_frees_the_space_for_uninitialized_objects) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1391,7 +1389,7 @@ TEST(GC_collecting_allocator__gc_impl, DestroyObject_sitll_frees_the_space_for_u
 
 TEST(GC_collecting_allocator__gc_impl, DestroyObject_will_destroy_initialized_objects) {
     static size_t destructionCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1412,7 +1410,7 @@ TEST(GC_collecting_allocator__gc_impl, DestroyObject_will_destroy_initialized_ob
 
 TEST(GC_collecting_allocator__gc_impl, DestroyObject_will_destroy_each_member_of_an_initialized_array) {
     static size_t destructionCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1433,7 +1431,7 @@ TEST(GC_collecting_allocator__gc_impl, DestroyObject_will_destroy_each_member_of
 
 TEST(GC_collecting_allocator__gc_impl, DestroyObject_will_destroy_objects_that_have_attempted_initialization) {
     static size_t destructionCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1454,7 +1452,7 @@ TEST(GC_collecting_allocator__gc_impl, DestroyObject_will_destroy_objects_that_h
 }
 
 TEST(GC_collecting_allocator__gc_impl, defragmentation_respects_alignment) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     GC.Allocate(default_gc_object_type_v<std::byte>, 1);
     GC.Allocate(default_gc_object_type_v<std::byte>, sizeof(int))->rootHandleCount = 0; // allocation that could fit an int but is not aligned to the alignment of int
     auto hInt = GC.Allocate(default_gc_object_type_v<int>, 1); // there are padding bytes before this allocation
@@ -1463,7 +1461,7 @@ TEST(GC_collecting_allocator__gc_impl, defragmentation_respects_alignment) {
 }
 
 TEST(GC_collecting_allocator__gc_impl, defragmentation_respects_alignment_2) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     GC.Allocate(default_gc_object_type_v<uint32_t>, 1);
     GC.Allocate(default_gc_object_type_v<uint32_t>, 2)->rootHandleCount = 0;
     GC.Allocate(default_gc_object_type_v<uint32_t>, 1)->rootHandleCount = 0;
@@ -1473,7 +1471,7 @@ TEST(GC_collecting_allocator__gc_impl, defragmentation_respects_alignment_2) {
 }
 
 TEST(GC_collecting_allocator__gc_impl, defragmentation_does_not_overwrite_memory_while_moving) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
 
     const auto hToBeMovedHere = GC.Allocate(default_gc_object_type_v<int>, 1);
     hToBeMovedHere->rootHandleCount = 0;
@@ -1497,7 +1495,7 @@ TEST(GC_collecting_allocator__gc_impl, defragmentation_does_not_overwrite_memory
 }
 
 TEST(GC_collecting_allocator__gc_impl, defarmentation_does_not_move_immovable_types) {
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type immovable {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1517,7 +1515,7 @@ TEST(GC_collecting_allocator__gc_impl, defarmentation_does_not_move_immovable_ty
 
 TEST(GC_collecting_allocator__gc_impl, defarmentation_does_not_move_the_data_of_uninitialized_objects) {
     static size_t moveCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1537,7 +1535,7 @@ TEST(GC_collecting_allocator__gc_impl, defarmentation_does_not_move_the_data_of_
 
 TEST(GC_collecting_allocator__gc_impl, defarmentation_moves_the_data_of_initialized_objects) {
     static size_t moveCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1557,7 +1555,7 @@ TEST(GC_collecting_allocator__gc_impl, defarmentation_moves_the_data_of_initiali
 
 TEST(GC_collecting_allocator__gc_impl, defarmentation_does_not_move_the_data_of_objects_that_failed_to_initialize) {
     static size_t moveCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1579,7 +1577,7 @@ TEST(GC_collecting_allocator__gc_impl, defarmentation_does_not_move_the_data_of_
 
 TEST(GC_collecting_allocator__gc_impl, defarmentation_moves_the_data_of_every_slot_if_the_object_is_an_array) {
     static size_t moveCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1599,7 +1597,7 @@ TEST(GC_collecting_allocator__gc_impl, defarmentation_moves_the_data_of_every_sl
 
 TEST(GC_collecting_allocator__gc_impl, defarmentation_still_relocates_uninitialized_objects) {
     static size_t moveCount;
-    gc::gc_impl GC({std::pmr::get_default_resource(), std::pmr::get_default_resource()});
+    gc::gc_impl GC(gc::gc_init_args{gc::GetDefaultAllocator()});
     const gc::object_type tInt {
         .size = sizeof(int),
         .alignment = alignof(int),
@@ -1778,7 +1776,7 @@ template <class T> struct gc::gc_object_traits<ClassC<T>> {
 
 TEST(GC_collecting_allocator__public_API, compiles) {
     TerminateOnDeadlockGuard guard{};
-    ASSERT_TRUE(gc::Init({std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
     gc::defer destroy([]{gc::Destroy();});
 
     gc::root_handle<ClassB> h0 = gc::New<ClassB>(gc::New<ClassA>());
@@ -1883,7 +1881,7 @@ TEST(GC_collecting_allocator__public_API, compiles) {
 
 TEST(GC_collecting_allocator__public_API, move_does_not_break_invariance) {
     TerminateOnDeadlockGuard guard{};
-    ASSERT_TRUE(gc::Init({std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
     gc::defer destroy([]{gc::Destroy();});
 
     auto handle = gc::root_handle<const int>(std::move(gc::New<int>(0)));
@@ -1976,7 +1974,7 @@ namespace gc {
 }
 TEST(GC_collecting_allocator__public_API, non_gc_allocated_member_does_not_cause_circular_references) {
     TerminateOnDeadlockGuard guard{};
-    ASSERT_TRUE(gc::Init({std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
     gc::defer destroy([]{gc::Destroy();});
 
     {
@@ -1998,7 +1996,7 @@ TEST(GC_collecting_allocator__public_API, non_gc_allocated_member_does_not_cause
 
 TEST(GC_collecting_allocator__public_API, field_assignment_from_another_field_does_not_break_invariance_on_copy) {
     TerminateOnDeadlockGuard guard{};
-    ASSERT_TRUE(gc::Init({std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
     gc::defer destroy([]{gc::Destroy();});
 
     gc::internal_handle *h1 = nullptr, *h2 = nullptr;
@@ -2034,7 +2032,7 @@ TEST(GC_collecting_allocator__public_API, field_assignment_from_another_field_do
 
 TEST(GC_collecting_allocator__public_API, field_assignment_from_another_field_does_not_break_invariance_on_move) {
     TerminateOnDeadlockGuard guard{};
-    ASSERT_TRUE(gc::Init({std::pmr::get_default_resource(), std::pmr::get_default_resource()}));
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
     gc::defer destroy([]{gc::Destroy();});
 
     gc::internal_handle *h1 = nullptr;

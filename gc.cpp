@@ -6,23 +6,14 @@
 #include <thread>
 
 namespace gc {
-    gc_impl::gc_impl() noexcept : gc_impl(gc_init_args{std::pmr::null_memory_resource(), std::pmr::null_memory_resource()}) {}
+    gc_impl::gc_impl() noexcept : gc_impl(gc_init_args{}) {}
     gc_impl::gc_impl(const gc_init_args &args)
-    : objectMemory(args.objectMemory)
-    , backingMemory(args.backingMemory)
-    , types(backingMemory)
-    , pages(backingMemory)
-    , pageAllocator(objectMemory)
-    , objectHandles(backingMemory)
-    , allocationToHandleLookup(backingMemory) {
-        if (objectMemory == nullptr) {
-            throw bad_api_usage("objectMemory is nullptr (use std::pmr::null_memory_resource() instead)");
-        }
-
-        if (backingMemory == nullptr) {
-            throw bad_api_usage("backingMemory is nullptr (use std::pmr::null_memory_resource() instead)");
-        }
-    }
+    : allocator(args.allocator)
+    , types(allocator->CreateTypesVector())
+    , pages(allocator->CreatePagesList())
+    , pageAllocator(allocator->CreatePageMemoryAllocator())
+    , objectHandles(allocator->CreateObjectHandlesContainer())
+    , allocationToHandleLookup(allocator->CreateAllocationToHandleLookup()) { }
 
     internal_handle *gc_impl::Allocate(const object_type &type, const size_t count) noexcept(false) {
         if constexpr (config::enable_debug_messages) {
@@ -541,7 +532,7 @@ namespace gc {
 
             std::construct_at(handle);
             handle->objectAllocation = allocation;
-            handle->referencedBy = std::pmr::vector<internal_handle*>(backingMemory);
+            handle->referencedBy = allocator->CreateReferencedByVectorForHandle();
             handle->objectType = type;
             handle->rootHandleCount = 1;
             handle->flags.ClearAll();
@@ -674,7 +665,7 @@ namespace gc {
         }
         scoped_rw_lock pageContainerLock(pagesLock, scoped_rw_lock::mode::rw);
 
-        auto &page = pages.emplace_back(backingMemory);
+        auto &page = pages.emplace_back(allocator->CreatePageAllocationsVectorForPage());
         try {
             InitPage(page);
         } catch (...) {
@@ -762,6 +753,55 @@ namespace gc {
 
             DestroyPage(page);
         }
+    }
+
+    struct non_owning_memory_resource_allocator final : gc_allocator {
+        std::pmr::memory_resource *resource = std::pmr::null_memory_resource();
+        non_owning_memory_resource_allocator(std::pmr::memory_resource *resource) : resource(resource) {
+            if (resource == nullptr) {
+                throw library_bug("resource is nullptr");
+            }
+        }
+
+        std::pmr::vector<object_type> CreateTypesVector() override {
+            return std::pmr::vector<object_type>(resource);
+        }
+
+        std::pmr::list<page> CreatePagesList() override {
+            return std::pmr::list<page>(resource);
+        }
+
+        std::pmr::polymorphic_allocator<page_memory> CreatePageMemoryAllocator() override {
+            return std::pmr::polymorphic_allocator<page_memory>(resource);
+        }
+
+        ptr_safe_container<internal_handle> CreateObjectHandlesContainer() override {
+            return ptr_safe_container<internal_handle>(resource);
+        }
+
+        std::pmr::unordered_map<const void *, internal_handle *> CreateAllocationToHandleLookup() override {
+            return std::pmr::unordered_map<const void*, internal_handle*>(resource);
+        }
+
+        std::pmr::vector<page::allocation> CreatePageAllocationsVectorForPage() override {
+            return std::pmr::vector<page::allocation>(resource);
+        }
+
+        std::pmr::vector<internal_handle *> CreateReferencedByVectorForHandle() override {
+            return std::pmr::vector<internal_handle*>(resource);
+        }
+
+        ~non_owning_memory_resource_allocator() override = default;
+    };
+
+    allocator_handle_t *GetNullAllocator() {
+        static non_owning_memory_resource_allocator allocator(std::pmr::null_memory_resource());
+        return &allocator;
+    }
+
+    allocator_handle_t *GetDefaultAllocator() {
+        static non_owning_memory_resource_allocator allocator(std::pmr::get_default_resource());
+        return &allocator;
     }
 
     size_t initCount = 0; // TODO: maybe debug assertions for being initialized (in debug mode only)
