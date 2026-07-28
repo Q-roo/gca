@@ -137,7 +137,17 @@ namespace gc {
         type_index objectType{};
         atomic_mark_bitfield markBits{0};
         rw_lock objectLock{}; // only for field/allocation modifications or for moving object during defragmentation
-        atomic_bit_set<object_flags> flags;
+        atomic_bit_set<object_flags> flags{};
+
+        // starting state
+        // this constructor exists solely because there was an issue with
+        // handle->referencedBy = std::move(allocator->CreateReferencedByVectorForHandle())
+        internal_handle(const page_allocation &allocation, std::pmr::vector<internal_handle*> &&referencedBy, const type_index type)
+        : objectAllocation(allocation)
+        , referencedBy(std::move(referencedBy))
+        , rootHandleCount(1)
+        , objectType(type)
+        , flags(object_flags::uninitialized) {}
 
         /**
          * @brief Assigns a new value to the field
@@ -235,13 +245,13 @@ namespace gc {
     }
 
     struct gc_allocator {
-        virtual std::pmr::vector<object_type> CreateTypesVector() = 0;
-        virtual std::pmr::list<page> CreatePagesList() = 0;
-        virtual std::pmr::polymorphic_allocator<page_memory> CreatePageMemoryAllocator() = 0;
-        virtual ptr_safe_container<internal_handle> CreateObjectHandlesContainer() = 0;
-        virtual std::pmr::unordered_map<const void*, internal_handle*> CreateAllocationToHandleLookup() = 0;
-        virtual std::pmr::vector<page::allocation> CreatePageAllocationsVectorForPage() = 0;
-        virtual std::pmr::vector<internal_handle*> CreateReferencedByVectorForHandle() = 0;
+        virtual std::pmr::vector<object_type> CreateTypesVector() noexcept = 0;
+        virtual std::pmr::list<page> CreatePagesList()  noexcept = 0;
+        virtual std::pmr::polymorphic_allocator<page_memory> CreatePageMemoryAllocator() noexcept = 0;
+        virtual ptr_safe_container<internal_handle> CreateObjectHandlesContainer()  noexcept= 0;
+        virtual std::pmr::unordered_map<const void*, internal_handle*> CreateAllocationToHandleLookup()  noexcept = 0;
+        virtual std::pmr::vector<page::allocation> CreatePageAllocationsVectorForPage()  noexcept = 0;
+        virtual std::pmr::vector<internal_handle*> CreateReferencedByVectorForHandle()  noexcept = 0;
         virtual ~gc_allocator() = default;
     };
 

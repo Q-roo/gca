@@ -9,11 +9,11 @@ namespace gc {
     gc_impl::gc_impl() noexcept : gc_impl(gc_init_args{}) {}
     gc_impl::gc_impl(const gc_init_args &args)
     : allocator(args.allocator)
-    , types(allocator->CreateTypesVector())
-    , pages(allocator->CreatePagesList())
-    , pageAllocator(allocator->CreatePageMemoryAllocator())
-    , objectHandles(allocator->CreateObjectHandlesContainer())
-    , allocationToHandleLookup(allocator->CreateAllocationToHandleLookup()) { }
+    , types(std::move(allocator->CreateTypesVector()))
+    , pages(std::move(allocator->CreatePagesList()))
+    , pageAllocator(allocator->CreatePageMemoryAllocator()) // trivially copyable
+    , objectHandles(std::move(allocator->CreateObjectHandlesContainer()))
+    , allocationToHandleLookup(std::move(allocator->CreateAllocationToHandleLookup())) { }
 
     internal_handle *gc_impl::Allocate(const object_type &type, const size_t count) noexcept(false) {
         if constexpr (config::enable_debug_messages) {
@@ -530,14 +530,7 @@ namespace gc {
         try {
             handle = &objectHandles.GetNextUninitialized();
 
-            std::construct_at(handle);
-            handle->objectAllocation = allocation;
-            handle->referencedBy = allocator->CreateReferencedByVectorForHandle();
-            handle->objectType = type;
-            handle->rootHandleCount = 1;
-            handle->flags.ClearAll();
-            handle->flags.SetFlag(object_flags::uninitialized, true);
-
+            std::construct_at(handle, allocation, std::move(allocator->CreateReferencedByVectorForHandle()), type);
             {
                 if constexpr (config::enable_debug_messages) {
                     debugListeners.onBeforeRegisterObjectTypesROLockAcquire(this, allocation, type);
@@ -665,7 +658,7 @@ namespace gc {
         }
         scoped_rw_lock pageContainerLock(pagesLock, scoped_rw_lock::mode::rw);
 
-        auto &page = pages.emplace_back(allocator->CreatePageAllocationsVectorForPage());
+        auto &page = pages.emplace_back(std::move(allocator->CreatePageAllocationsVectorForPage()));
         try {
             InitPage(page);
         } catch (...) {
@@ -763,31 +756,31 @@ namespace gc {
             }
         }
 
-        std::pmr::vector<object_type> CreateTypesVector() override {
+        std::pmr::vector<object_type> CreateTypesVector() noexcept override {
             return std::pmr::vector<object_type>(resource);
         }
 
-        std::pmr::list<page> CreatePagesList() override {
+        std::pmr::list<page> CreatePagesList() noexcept override {
             return std::pmr::list<page>(resource);
         }
 
-        std::pmr::polymorphic_allocator<page_memory> CreatePageMemoryAllocator() override {
+        std::pmr::polymorphic_allocator<page_memory> CreatePageMemoryAllocator() noexcept override {
             return std::pmr::polymorphic_allocator<page_memory>(resource);
         }
 
-        ptr_safe_container<internal_handle> CreateObjectHandlesContainer() override {
+        ptr_safe_container<internal_handle> CreateObjectHandlesContainer() noexcept override {
             return ptr_safe_container<internal_handle>(resource);
         }
 
-        std::pmr::unordered_map<const void *, internal_handle *> CreateAllocationToHandleLookup() override {
+        std::pmr::unordered_map<const void *, internal_handle *> CreateAllocationToHandleLookup() noexcept override {
             return std::pmr::unordered_map<const void*, internal_handle*>(resource);
         }
 
-        std::pmr::vector<page::allocation> CreatePageAllocationsVectorForPage() override {
+        std::pmr::vector<page::allocation> CreatePageAllocationsVectorForPage() noexcept override {
             return std::pmr::vector<page::allocation>(resource);
         }
 
-        std::pmr::vector<internal_handle *> CreateReferencedByVectorForHandle() override {
+        std::pmr::vector<internal_handle *> CreateReferencedByVectorForHandle() noexcept override {
             return std::pmr::vector<internal_handle*>(resource);
         }
 

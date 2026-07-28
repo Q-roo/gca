@@ -1,5 +1,6 @@
 #include <memory_resource>
 #include <cpuid.h>
+#include <ranges>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
@@ -83,6 +84,84 @@ std::string demangled_type_name() {
 
     return status == 0 ? res.get() : typeid(T).name();
 }
+
+class simulated_out_of_storage_resource : public std::pmr::memory_resource {
+    size_t maxAllocationCount = 0, currentAllocationCount = 0;
+    std::pmr::unsynchronized_pool_resource resource{};
+public:
+    simulated_out_of_storage_resource(size_t maxAllocationCount) : maxAllocationCount(maxAllocationCount) {}
+    simulated_out_of_storage_resource() = default;
+
+    ~simulated_out_of_storage_resource() override = default;
+
+private:
+    void * do_allocate(std::size_t __bytes, std::size_t __alignment) override {
+        if (currentAllocationCount++ >= maxAllocationCount) {
+            throw std::bad_alloc();
+        }
+        return resource.allocate(__bytes, __alignment);
+    }
+
+    void do_deallocate(void *__p, std::size_t __bytes, std::size_t __alignment) override {
+        return resource.deallocate(__p, __bytes, __alignment);
+    }
+
+    bool do_is_equal(const memory_resource &__other) const noexcept override {
+        return resource.is_equal(__other);
+    }
+};
+
+struct allocation_failure_test_allocator : gc::gc_allocator {
+    simulated_out_of_storage_resource types, pages, pageMemories, ptrSafeContainerNodes,
+                                      lookupNodes, pageAllocations, referencedBy;
+
+    allocation_failure_test_allocator(
+        const size_t maxTypes = 0,
+        const size_t maxPages = 0,
+        const size_t maxPageMemories = 0, // to simulate allocation failure after the page was allocated
+        const size_t maxPageAllocations = 0,
+        const size_t maxObjectNodes = 0, // 1 node contains 64 objects
+        const size_t maxObjectLookupNodes = 0, // not specified
+        const size_t maxReferencedBy = 0
+    )
+    : types(maxTypes)
+    , pages(maxPages)
+    , pageMemories(maxPageMemories)
+    , ptrSafeContainerNodes(maxObjectNodes)
+    , lookupNodes(maxObjectLookupNodes)
+    , pageAllocations(maxPageAllocations)
+    , referencedBy(maxReferencedBy) {}
+
+    std::pmr::vector<gc::object_type> CreateTypesVector() noexcept override {
+        return std::pmr::vector<gc::object_type>(&types);
+    }
+
+    std::pmr::list<gc::page> CreatePagesList() noexcept override {
+        return std::pmr::list<gc::page>(&pages);
+    }
+
+    std::pmr::polymorphic_allocator<gc::page_memory> CreatePageMemoryAllocator() noexcept override {
+        return {&pageMemories};
+    }
+
+    gc::ptr_safe_container<gc::internal_handle> CreateObjectHandlesContainer() noexcept override {
+        return {&ptrSafeContainerNodes, std::pmr::new_delete_resource()};
+    }
+
+    std::pmr::unordered_map<const void *, gc::internal_handle *> CreateAllocationToHandleLookup() noexcept override {
+        return std::pmr::unordered_map<const void *, gc::internal_handle *>(&lookupNodes);
+    }
+
+    std::pmr::vector<gc::page::allocation> CreatePageAllocationsVectorForPage() noexcept override {
+        return std::pmr::vector<gc::page::allocation>(&pageAllocations);
+    }
+
+    std::pmr::vector<gc::internal_handle *> CreateReferencedByVectorForHandle() noexcept override {
+        return std::pmr::vector<gc::internal_handle *>(&referencedBy);
+    }
+
+    ~allocation_failure_test_allocator() override = default;
+};
 
 enum class test_flags_for_atomic_bit_set : uint8_t {
     none = 0,
@@ -2060,6 +2139,189 @@ TEST(GC_collecting_allocator__public_API, field_assignment_from_another_field_do
 
     gc::Collect();
     EXPECT_EQ(gc::impl->pages.front().allocations.size(), 0);
+}
+
+TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_page_allocation_failure) {
+    TerminateOnDeadlockGuard guard{};
+    allocation_failure_test_allocator allocator{
+        0, // types (vector)
+        0, // pages (linked list)
+        0, // pages (object memory)
+        0, // page allocations (vector)
+        0, // object nodes (n * 64)
+        0, // lookup (unordered map) (happens before the handle allocation)
+        0, // referenced by (vector)
+    };
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+    gc::defer destroy(&gc::Destroy);
+
+    EXPECT_THROW(gc::New<int>(), std::bad_alloc);
+    EXPECT_TRUE(gc::impl->pagesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->pagesLock.Release();
+    EXPECT_TRUE(gc::impl->pageAllocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pageAllocationLock.Release();
+}
+
+TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_page_node_allocation_failure) {
+    TerminateOnDeadlockGuard guard{};
+    allocation_failure_test_allocator allocator{
+        0, // types (vector)
+        1, // pages (linked list)
+        0, // pages (object memory)
+        0, // page allocations (vector)
+        0, // object nodes (n * 64)
+        0, // lookup (unordered map) (happens before the handle allocation)
+        0, // referenced by (vector)
+    };
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+    gc::defer destroy(&gc::Destroy);
+
+    EXPECT_THROW(gc::New<int>(), std::bad_alloc);
+    EXPECT_TRUE(gc::impl->pagesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->pagesLock.Release();
+    EXPECT_TRUE(gc::impl->pageAllocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pageAllocationLock.Release();
+    EXPECT_EQ(gc::impl->pages.size(), 0) << "uninitialized page not removed";
+}
+
+TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_page_allocation_entry_allocation_failure) {
+    TerminateOnDeadlockGuard guard{};
+    allocation_failure_test_allocator allocator{
+        0, // types (vector)
+        1, // pages (linked list)
+        1, // pages (object memory)
+        0, // page allocations (vector)
+        0, // object nodes (n * 64)
+        0, // lookup (unordered map) (happens before the handle allocation)
+        0, // referenced by (vector)
+    };
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+    gc::defer destroy(&gc::Destroy);
+
+    EXPECT_THROW(gc::New<int>(), std::bad_alloc);
+    EXPECT_TRUE(gc::impl->pagesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->pagesLock.Release();
+    EXPECT_TRUE(gc::impl->pageAllocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pageAllocationLock.Release();
+    EXPECT_EQ(gc::impl->pages.size(), 1) << "initialized page not removed";
+}
+
+TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_type_allocation_failure) {
+    TerminateOnDeadlockGuard guard{};
+    allocation_failure_test_allocator allocator{
+        0, // types (vector)
+        1, // pages (linked list)
+        1, // pages (object memory)
+        1, // page allocations (vector)
+        0, // object nodes (n * 64)
+        0, // lookup (unordered map) (happens before the handle allocation)
+        0, // referenced by (vector)
+    };
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+    gc::defer destroy(&gc::Destroy);
+
+    EXPECT_THROW(gc::New<int>(), std::bad_alloc);
+    EXPECT_TRUE(gc::impl->pagesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->pagesLock.Release();
+    EXPECT_TRUE(gc::impl->pageAllocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pageAllocationLock.Release();
+    EXPECT_EQ(gc::impl->pages.size(), 1) << "initialized page not removed";
+    EXPECT_TRUE(gc::impl->pages.front().allocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pages.front().allocationLock.Release();
+    EXPECT_TRUE(gc::impl->typesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->typesLock.Release();
+    EXPECT_EQ(gc::impl->pages.front().allocations.size(), 0) << "allocation not released";
+}
+
+TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_lookup_allocation_failure) {
+    TerminateOnDeadlockGuard guard{};
+    allocation_failure_test_allocator allocator{
+        1, // types (vector)
+        1, // pages (linked list)
+        1, // pages (object memory)
+        1, // page allocations (vector)
+        1, // object nodes (n * 64)
+        0, // lookup (unordered map) (happens before the handle allocation)
+        0, // referenced by (vector)
+    };
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+    gc::defer destroy(&gc::Destroy);
+
+    EXPECT_THROW(gc::New<int>(), std::bad_alloc);
+    EXPECT_TRUE(gc::impl->pagesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->pagesLock.Release();
+    EXPECT_TRUE(gc::impl->pageAllocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pageAllocationLock.Release();
+    EXPECT_EQ(gc::impl->pages.size(), 1) << "initialized page not removed";
+    EXPECT_TRUE(gc::impl->pages.front().allocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pages.front().allocationLock.Release();
+    EXPECT_TRUE(gc::impl->typesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->typesLock.Release();
+    EXPECT_EQ(gc::impl->pages.front().allocations.size(), 0) << "allocation not released";
+    EXPECT_TRUE(gc::impl->allocationLookupLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->allocationLookupLock.Release();
+}
+
+TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_handle_allocation_failure) {
+    TerminateOnDeadlockGuard guard{};
+    allocation_failure_test_allocator allocator{
+        1, // types (vector)
+        1, // pages (linked list)
+        1, // pages (object memory)
+        1, // page allocations (vector)
+        0, // object nodes (n * 64)
+        1, // lookup (unordered map) (happens before the handle allocation)
+        0, // referenced by (vector)
+    };
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+    gc::defer destroy(&gc::Destroy);
+
+    EXPECT_THROW(gc::New<int>(), std::bad_alloc);
+    EXPECT_TRUE(gc::impl->pagesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->pagesLock.Release();
+    EXPECT_TRUE(gc::impl->pageAllocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pageAllocationLock.Release();
+    EXPECT_EQ(gc::impl->pages.size(), 1) << "initialized page not removed";
+    EXPECT_TRUE(gc::impl->pages.front().allocationLock.TryAcquire()) << "mutex not released";
+    gc::impl->pages.front().allocationLock.Release();
+    EXPECT_TRUE(gc::impl->typesLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->typesLock.Release();
+    EXPECT_EQ(gc::impl->pages.front().allocations.size(), 0) << "allocation not released";
+    EXPECT_TRUE(gc::impl->allocationLookupLock.TryAcquireWrite()) << "lock not released";
+    gc::impl->allocationLookupLock.Release();
+    EXPECT_TRUE(gc::impl->allocationToHandleLookup.empty()) << "handle registration for allocation not rolled back";
+}
+
+TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_referenced_by_allocation_failure) {
+    TerminateOnDeadlockGuard guard{};
+    allocation_failure_test_allocator allocator{
+        2, // types (vector)
+        1, // pages (linked list)
+        1, // pages (object memory)
+        2, // page allocations (vector)
+        1, // object nodes (n * 64)
+        3, // lookup (unordered map) (happens before the handle allocation)
+        0, // referenced by (vector)
+    };
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+    gc::defer destroy(&gc::Destroy);
+
+    gc::root_handle<ClassA> a{};
+    EXPECT_NO_THROW(a = gc::New<ClassA>());
+    EXPECT_THROW(gc::New<ClassB>(a), std::bad_alloc); // will throw in initialization, which happens after object allocation
+    EXPECT_EQ(gc::impl->allocationToHandleLookup.size(), 2) << "object that failed to initialize did not become floating garbage";
+    gc::internal_handle *hClassB = nullptr;
+    for (gc::internal_handle *handle : std::ranges::views::values(gc::impl->allocationToHandleLookup)) {
+        if (handle != a.handle) {
+            hClassB = handle;
+        }
+    }
+    ASSERT_NE(hClassB, nullptr);
+    EXPECT_FALSE(gc::internal::Equals(*gc::gc_object_traits<ClassB>::get_field(hClassB->objectAllocation.data(), 0), a.handle)) << "field assignment not rolled back";
+    EXPECT_TRUE(a.handle->objectLock.TryAcquireWrite()) << "lock not released";
+    a.handle->objectLock.Release();
+    EXPECT_TRUE(hClassB->objectLock.TryAcquireWrite()) << "lock not released";
+    hClassB->objectLock.Release();
 }
 
 int main(int argc, char **argv) {

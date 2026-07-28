@@ -464,7 +464,7 @@ namespace gc {
 
         ptr_safe_container(ptr_safe_container &&other) noexcept
         : allocator(std::move(other.allocator))
-        , nodes(std::move(nodes)) {}
+        , nodes(std::move(other.nodes)) {}
 
         ptr_safe_container &operator=(ptr_safe_container &&other) noexcept {
             if (this == &other) {
