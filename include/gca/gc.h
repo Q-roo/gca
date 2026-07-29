@@ -3,8 +3,6 @@
 #include <typeindex>
 #include <utility>
 
-#include "gc.h"
-
 namespace gc {
     typedef struct internal_handle handle_t;
     typedef struct gc_allocator allocator_handle_t;
@@ -125,7 +123,7 @@ namespace gc {
             return *this;
         }
 
-        constexpr root_handle(root_handle &&other) noexcept : handle(std::move(other.handle)) {}
+        constexpr root_handle(root_handle &&other) noexcept : handle(std::exchange(other.handle, nullptr)) {}
         constexpr root_handle &operator=(root_handle &&other) noexcept {
             if (&other == this) {
                 return *this;
@@ -222,7 +220,7 @@ namespace gc {
                 return nullptr;
             }
 
-            return static_cast<return_pointer_type>(internal::GetInstance(handle, role));
+            return std::launder(static_cast<return_pointer_type>(internal::GetInstance(handle, role)));
         }
 
         return_pointer_type operator ->() const {
@@ -288,7 +286,7 @@ namespace gc {
                 return nullptr;
             }
 
-            return static_cast<return_pointer_type>(internal::GetInstance(handle, role));
+            return std::launder(static_cast<return_pointer_type>(internal::GetInstance(handle, role)));
         }
 
         constexpr std::add_lvalue_reference_t<return_element_type> operator [](size_t index) const
@@ -352,7 +350,7 @@ namespace gc {
 
         field(const field &other) { Set(other); }
         field& operator=(const field &other) { if (&other != this) { Set(other); } return *this; }
-        field(field &&other) {auto oldValue = Get(); Set(other); other.Set(oldValue, handle_role::field); }
+        field(field &&other) {Set(other); other.Set(nullptr, handle_role::field); }
         field& operator=(field &&other) { if (&other != this) { auto oldValue = Get(); Set(other); other.Set(oldValue, handle_role::field); } return *this; }
 
         field(std::nullptr_t) noexcept : field() {}
@@ -550,7 +548,7 @@ namespace gc {
                 internal::Destroy(Get(), handle_role::root);
             }
             else {
-                // managed mode or indicrectly managed
+                // managed mode or indirectly managed
                 internal::SetField(obj, GetField(), nullptr, handle_role::unknown);
             }
         }

@@ -9,11 +9,11 @@ namespace gc {
     gc_impl::gc_impl() noexcept : gc_impl(gc_init_args{}) {}
     gc_impl::gc_impl(const gc_init_args &args)
     : allocator(args.allocator)
-    , types(std::move(allocator->CreateTypesVector()))
-    , pages(std::move(allocator->CreatePagesList()))
-    , pageAllocator(allocator->CreatePageMemoryAllocator()) // trivially copyable
-    , objectHandles(std::move(allocator->CreateObjectHandlesContainer()))
-    , allocationToHandleLookup(std::move(allocator->CreateAllocationToHandleLookup())) { }
+    , types(allocator->CreateTypesVector())
+    , pages(allocator->CreatePagesList())
+    , pageAllocator(allocator->CreatePageMemoryAllocator())
+    , objectHandles(allocator->CreateObjectHandlesContainer())
+    , allocationToHandleLookup(allocator->CreateAllocationToHandleLookup()) { }
 
     internal_handle *gc_impl::Allocate(const object_type &type, const size_t count) noexcept(false) {
         if constexpr (config::enable_debug_messages) {
@@ -159,7 +159,7 @@ namespace gc {
     }
 
     void gc_impl::RelocateObject(
-        page &page,
+        const page &page,
         internal_handle *handle,
         const object_type *type,
         page::allocation &allocation,
@@ -194,7 +194,7 @@ namespace gc {
         }
 
         handle->objectAllocation = { static_cast<std::byte *>(newLocation), allocation.size };
-        allocation.offset = reinterpret_cast<uintptr_t>(newLocation) - reinterpret_cast<uintptr_t>(page.memory->data());
+        allocation.offset = static_cast<page::allocation::size_type>(reinterpret_cast<uintptr_t>(newLocation) - reinterpret_cast<uintptr_t>(page.memory->data()));
     }
 
     void internal_handle::SetField(internal_handle **field, internal_handle *newValue) noexcept(false) {
@@ -518,7 +518,7 @@ namespace gc {
         if constexpr (config::enable_debug_messages) {
             debugListeners.onBeforeRegisterObjectLookupRWLockAcquire(this, allocation, type);
         }
-        scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
+        scoped_rw_lock lockLookup(allocationLookupLock, scoped_rw_lock::mode::rw);
 
         const auto [it, success] = allocationToHandleLookup.insert(std::make_pair(allocation.data(), nullptr));
 
@@ -530,12 +530,12 @@ namespace gc {
         try {
             handle = &objectHandles.GetNextUninitialized();
 
-            std::construct_at(handle, allocation, std::move(allocator->CreateReferencedByVectorForHandle()), type);
+            std::construct_at(handle, allocation, allocator->CreateReferencedByVectorForHandle(), type);
             {
                 if constexpr (config::enable_debug_messages) {
                     debugListeners.onBeforeRegisterObjectTypesROLockAcquire(this, allocation, type);
                 }
-                scoped_rw_lock lock(typesLock);
+                scoped_rw_lock lockTypes(typesLock);
                 if (types[type].move == nullptr) {
                     handle->flags.SetFlag(object_flags::immovable, true);
                 }
@@ -564,7 +564,8 @@ namespace gc {
             const auto padding = GetAlignmentCorrection(lastAllocationEnd, alignment);
 
             if (gap >= size + padding) {
-                if (i > std::numeric_limits<ptrdiff_t>::max()) [[unlikely]] {
+                constexpr size_t max_value = std::numeric_limits<ptrdiff_t>::max();
+                if (i > max_value) [[unlikely]] {
                     break;
                 }
 
@@ -635,8 +636,12 @@ namespace gc {
             // multiple threads might have tried to add the same type
             found = std::ranges::find(types, type);
             if (found == types.end()) {
+                if (types.size() > static_cast<size_t>(std::numeric_limits<type_index>::max()) + 1) {
+                    throw too_many_types("the amount of types exceed the the max value of the indexing type");
+                }
+
                 types.emplace_back(type);
-                return types.size() - 1;
+                return static_cast<type_index>(types.size() - 1);
             }
         }
 
@@ -658,7 +663,7 @@ namespace gc {
         }
         scoped_rw_lock pageContainerLock(pagesLock, scoped_rw_lock::mode::rw);
 
-        auto &page = pages.emplace_back(std::move(allocator->CreatePageAllocationsVectorForPage()));
+        auto &page = pages.emplace_back(allocator->CreatePageAllocationsVectorForPage());
         try {
             InitPage(page);
         } catch (...) {
@@ -694,7 +699,7 @@ namespace gc {
         // force destroying objects
         // remove all references and set all fields to null
         for (page &page : pages) {
-            scoped_mutex_lock lock(page.allocationLock);
+            scoped_mutex_lock lockPage(page.allocationLock);
 
             const auto begin = reinterpret_cast<uintptr_t>(page.memory->data());
             for (auto allocation : page.allocations) {
@@ -704,11 +709,11 @@ namespace gc {
                     debugListeners.onBeforeDestructorObjectRWLockAcquire(this, handle);
                 }
 
-                scoped_rw_lock lock(handle->objectLock, scoped_rw_lock::mode::rw);
+                scoped_rw_lock lockObject(handle->objectLock, scoped_rw_lock::mode::rw);
 
                 const object_type *type = nullptr;
                 {
-                    scoped_rw_lock lock(typesLock);
+                    scoped_rw_lock lockTypes(typesLock);
                     type = &types[handle->objectType];
                 }
 
@@ -765,11 +770,11 @@ namespace gc {
         }
 
         std::pmr::polymorphic_allocator<page_memory> CreatePageMemoryAllocator() noexcept override {
-            return std::pmr::polymorphic_allocator<page_memory>(resource);
+            return {resource};
         }
 
         ptr_safe_container<internal_handle> CreateObjectHandlesContainer() noexcept override {
-            return ptr_safe_container<internal_handle>(resource);
+            return {resource, resource};
         }
 
         std::pmr::unordered_map<const void *, internal_handle *> CreateAllocationToHandleLookup() noexcept override {
@@ -997,7 +1002,9 @@ namespace gc {
         }
 
         handle_t *LookupObjectOrGetOwningObject(const void *obj) noexcept {
-            handle_t *handle = LookupObject(obj);
+            if (handle_t *handle = LookupObject(obj); handle != nullptr) {
+                return handle;
+            }
 
             scoped_rw_lock lock(impl->allocationLookupLock);
             for (handle_t *handle : std::views::values(impl->allocationToHandleLookup)) {

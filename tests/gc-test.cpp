@@ -1,11 +1,19 @@
 #include <memory_resource>
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
 #include <cpuid.h>
+#endif
 #include <ranges>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
 #include <gca/gc-internal.h>
 #include <gca/gc.h>
+
+#ifdef _MSC_VER
+#define no_unique_address msvc::no_unique_address
+#endif
 
 /*
  * things to test:
@@ -76,6 +84,9 @@ void TerminateOnDeadlockGuard::waitForCompletion()
 
 template <typename T>
 std::string demangled_type_name() {
+#ifdef  _MSC_VER
+    return typeid(T).name();
+#else
     int status = 0;
     std::unique_ptr<char, void(*)(void*)> res {
         abi::__cxa_demangle(typeid(T).name(), nullptr, nullptr, &status),
@@ -83,6 +94,7 @@ std::string demangled_type_name() {
     };
 
     return status == 0 ? res.get() : typeid(T).name();
+#endif
 }
 
 class simulated_out_of_storage_resource : public std::pmr::memory_resource {
@@ -1021,15 +1033,29 @@ TEST(GC_utility__ptr_safe_container__node, does_not_throw_on_out_of_bounds_slot_
 }
 
 TEST(GC_utility__ptr_safe_container, does_not_allocates_the_first_node_on_construction) {
-    EXPECT_NO_THROW(gc::ptr_safe_container<uint8_t>({std::pmr::null_memory_resource()}, {std::pmr::null_memory_resource()}));
+#ifdef _MSC_VER
+    // Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x86
+    // can't do anything about this:
+    // std::pmr::vector<T>(std::pmr::null_memory_resource()) ->
+    //  _CONSTEXPR20_CONTAINER explicit vector(const _Alloc& _Al) noexcept ->
+    //  _Mypair._Myval2._Alloc_proxy(_GET_PROXY_ALLOCATOR(_Alty, _Getal())) -> (vector)
+    // _Container_proxy* const _New_proxy = _Unfancy(_Al.allocate(1)) (xmemory)
+    // should fail because std::terminate will be called
+    // because the constructor is noexcept
+    // actual exit code will be 3
+    EXPECT_EXIT({
+        EXPECT_NO_THROW(gc::ptr_safe_container<uint8_t>(std::pmr::null_memory_resource(), std::pmr::null_memory_resource()));
+        std::exit(0);
+    }, testing::ExitedWithCode(0), "");
+#else
+    // msvc hates this
+    EXPECT_NO_THROW(gc::ptr_safe_container<uint8_t>(std::pmr::null_memory_resource(), std::pmr::null_memory_resource()));
+#endif
 }
 
 namespace gc {
     class ptr_safe_container_test_access {
 public:
-        template <class T>
-        using actual_node_type = ptr_safe_container<T>::node_mimick;
-
         template <class T>
         static auto &GetNodes(ptr_safe_container<T>& container) {
             return container.nodes;
@@ -1048,7 +1074,7 @@ public:
 
 class allocation_tracking_resource : public std::pmr::monotonic_buffer_resource {
 public:
-    size_t allocationCount;
+    size_t allocationCount{0};
 private:
     void *do_allocate(std::size_t __bytes, std::size_t __alignment) override {
         allocationCount++;
@@ -1063,16 +1089,16 @@ private:
 
 TEST(GC_utility__ptr_safe_container, strong_exception_guarantee_for_allocator_failure) {
     {
-        std::array<uint8_t, sizeof(gc::ptr_safe_container_test_access::actual_node_type<uint8_t>)> buffer{0};
+        std::array<uint8_t, sizeof(gc::ptr_safe_container<uint8_t>::node)> buffer{0};
         auto res = std::pmr::monotonic_buffer_resource(buffer.data(), buffer.size(), std::pmr::null_memory_resource());
-        ASSERT_NO_THROW(gc::ptr_safe_container<uint8_t>({&res}, {})) << "less than the minimal amount of memory required for construction";
+        ASSERT_NO_THROW(gc::ptr_safe_container<uint8_t>(&res, std::pmr::get_default_resource())) << "less than the minimal amount of memory required for construction";
     }
 
     // first, the node is allocated and then, the pointer to it gets added to nodes
     {
-        std::array<uint8_t, sizeof(gc::ptr_safe_container_test_access::actual_node_type<uint8_t>)> buffer{0};
+        std::array<uint8_t, sizeof(gc::ptr_safe_container<uint8_t>::node)> buffer{0};
         auto res = std::pmr::monotonic_buffer_resource(buffer.data(), buffer.size(), std::pmr::null_memory_resource());
-        auto data = gc::ptr_safe_container<uint8_t>({&res}, {});
+        auto data = gc::ptr_safe_container<uint8_t>(&res, std::pmr::get_default_resource());
 
         for (size_t i = 0; i < gc::ptr_safe_container<uint8_t>::node::capacity; ++i) {
             EXPECT_NO_THROW(data.GetNextUninitialized()) << "shouldn't throw node fullness is only " << i << "/" << static_cast<size_t>(gc::ptr_safe_container<uint8_t>::node::capacity);
@@ -1086,10 +1112,10 @@ TEST(GC_utility__ptr_safe_container, strong_exception_guarantee_for_allocator_fa
     }
 
     {
-        std::array<uint8_t, sizeof(void*) * 2> buffer{0};
-        auto res = std::pmr::monotonic_buffer_resource(buffer.data(), buffer.size(), std::pmr::null_memory_resource());
+        std::array<void*, 2> buffer{nullptr};
+        auto res = std::pmr::monotonic_buffer_resource(buffer.data(), sizeof(buffer), std::pmr::null_memory_resource());
         auto nodeRes = allocation_tracking_resource();
-        auto data = gc::ptr_safe_container<uint8_t>({&nodeRes}, {&res});
+        auto data = gc::ptr_safe_container<uint8_t>(&nodeRes, &res);
 
         for (size_t i = 0; i < gc::ptr_safe_container<uint8_t>::node::capacity; ++i) {
             EXPECT_NO_THROW(data.GetNextUninitialized()) << "shouldn't throw node fullness is only " << i << "/" << static_cast<size_t>(gc::ptr_safe_container<uint8_t>::node::capacity);
@@ -1765,7 +1791,7 @@ struct Base {
 };
 
 TEST(GC_assumption, this_in_a_member_with_no_unique_address_equals_to_the_pointer_to_the_object_that_has_the_member) {
-    Base b;
+    Base b{};
     EXPECT_EQ(&b, b.member.GetThis());
 }
 
@@ -1775,8 +1801,15 @@ TEST(GC_assumption, ptr_is_64_bits) {
 
 TEST(GC_assumption, virtual_address_size_is_48) {
     constexpr unsigned int leaf = 0x80000008;
+#ifdef _MSC_VER
+    int registers[4];
+    __cpuid(registers, std::bit_cast<int>(leaf));
+    const auto eax = std::bit_cast<unsigned int>(registers[0]);
+#else
     unsigned int eax, ebx, ecx, edx;
     ASSERT_NE(__get_cpuid(leaf, &eax, &ebx, &ecx, &edx), 0) << "cpu not supported";
+
+#endif
     const auto addressBits = eax & 0x000000FF;
     EXPECT_EQ(addressBits, 48);
 }

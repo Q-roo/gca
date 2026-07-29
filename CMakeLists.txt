@@ -25,6 +25,13 @@ target_sources(
         include/gca/gc-internal.h
 )
 
+if(MSVC)
+    target_compile_options(gca PRIVATE /W4 /WX)
+else()
+    target_compile_options(gca PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+
+
 include(FetchContent)
 FetchContent_Declare(
         googletest

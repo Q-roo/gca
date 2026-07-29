@@ -479,15 +479,14 @@ namespace gc {
         struct node {
             constexpr static uint8_t capacity = 64;
             uint64_t takenFlags = 0;
-            // T data[capacity];
-            T *data = nullptr; // trailing array
+            std::aligned_storage_t<sizeof(T), alignof(T)> data[capacity];
 
             [[nodiscard]] constexpr bool HasFreeSlot() const noexcept {
                 return takenFlags != std::numeric_limits<uint64_t>::max();
             }
 
             [[nodiscard]] constexpr uint8_t NextFreeSlot() const noexcept {
-                return 64 - std::countl_zero(takenFlags);
+                return static_cast<uint8_t>(64 - std::countl_zero(takenFlags));
             }
 
             constexpr void SetSlotIsFree(const uint8_t slot, const bool isFree) noexcept(!config::gc_throw_nonessential_exceptions) {
@@ -519,30 +518,25 @@ namespace gc {
         };
 
         using node_allocator = std::pmr::polymorphic_allocator<node>;
-        using node_ptr_allocator = std::pmr::vector<node*>::allocator_type;
 
     private:
         node_allocator allocator;
         std::pmr::vector<node*> nodes;
 
-        struct node_mimick {node node; T data[node::capacity];};
         node *AllocateNode() {
-            auto *nodeExtended = static_cast<node_mimick*>(allocator.allocate_bytes(sizeof(node_mimick), alignof(node_mimick)));
-            nodeExtended->node.takenFlags = 0;
-            nodeExtended->node.data = nodeExtended->data;
-            return reinterpret_cast<node*>(nodeExtended);
+            return allocator.template new_object<node>();
         }
 
         void DestroyNode(node *node) noexcept {
-            for (size_t i = 0; i < node::capacity; ++i) {
+            for (uint8_t i = 0; i < node::capacity; ++i) {
                 if (node->GetSlotIsFree(i)) {
                     continue;
                 }
 
-                std::destroy_at(&node->data[i]);
+                std::destroy_at(std::launder(reinterpret_cast<T*>(&node->data[i])));
             }
 
-            allocator.deallocate_bytes(node, sizeof(node_mimick), alignof(node_mimick));
+            allocator.delete_object(node);
         }
 
         T& GetNextWritable() {
@@ -559,7 +553,7 @@ namespace gc {
                 node = AllocateNode();
                 try {
                     nodes.push_back(node);
-                } catch (std::exception&) {
+                } catch (...) {
                     DestroyNode(node);
                     throw;
                 }
@@ -567,12 +561,14 @@ namespace gc {
 
             auto slot = node->NextFreeSlot();
             node->SetSlotIsFree(slot, false);
-            return node->data[slot];
+            return *std::launder(reinterpret_cast<T*>(&node->data[slot]));
         }
     public:
-        ptr_safe_container(const node_allocator &allocator = node_allocator(),
-                        const node_ptr_allocator &ptr_allocator = node_ptr_allocator())
-            : allocator(allocator), nodes(ptr_allocator) {}
+        ptr_safe_container(std::pmr::memory_resource *nodeResource, std::pmr::memory_resource *nodeContainerResource)
+        : allocator(nodeResource), nodes(nodeContainerResource) {}
+
+        ptr_safe_container()
+        : allocator(), nodes() {}
 
         T& Insert(const T& v) {
             return GetNextWritable() = v;
@@ -607,12 +603,12 @@ namespace gc {
 
         void Remove(const T *value) {
             for (auto &node : nodes) {
-                for (size_t i = 0; i < node::capacity; ++i) {
+                for (uint8_t i = 0; i < node::capacity; ++i) {
                     if (node->GetSlotIsFree(i)) {
                         continue;
                     }
 
-                    if (&node->data[i] == value) {
+                    if (&node->data[i] == static_cast<const void *>(value)) {
                         std::destroy_at(&node->data[i]);
                         node->SetSlotIsFree(i, true);
                         return;

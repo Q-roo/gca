@@ -267,7 +267,11 @@ namespace gc {
         std::pmr::unordered_map<const void*, internal_handle*> allocationToHandleLookup{};
         rw_lock allocationLookupLock{}; // for both the container and the lookup
         std::atomic<thread_count> gcCount{0};
+#ifdef _MSC_VER
+        [[msvc::no_unique_address]] std::conditional_t<config::enable_debug_messages, debug::debug_listeners, std::monostate> debugListeners{};
+#else
         [[no_unique_address]] std::conditional_t<config::enable_debug_messages, debug::debug_listeners, std::monostate> debugListeners{};
+#endif
 
         /**
          * @brief constructs a gc_impl that cannot allocate
@@ -322,7 +326,7 @@ namespace gc {
          * @note Immovable objects will not be moved
          */
         void RelocateObject(
-            page &page,
+            const page &page,
             internal_handle *handle,
             const object_type *type,
             page::allocation &allocation,
