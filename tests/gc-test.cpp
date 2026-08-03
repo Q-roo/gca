@@ -1,4 +1,5 @@
 #include <memory_resource>
+
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
@@ -136,6 +137,25 @@ struct allocation_failure_test_allocator : gc::gc_allocator {
         const size_t maxObjectLookupNodes = 0, // not specified
         const size_t maxReferencedBy = 0
     )
+#ifdef _MSC_VER
+#define MAYBE_DEBUG_OVERHEAD(n) (std::is_same_v<std::_Container_base, std::_Container_base12> ? (n) : 0)
+#define GUARANTEED_OVERHEAD(n) n
+#define OVERHEAD(dbg, guaranteed) (MAYBE_DEBUG_OVERHEAD((dbg)) + GUARANTEED_OVERHEAD((guaranteed)))
+    // +1 for allocating the proxy in std::vector
+    // +2 for std::list (proxy + head) (head gets allocated in release as well)
+    // +4 for unordered_map (list + vector + initial bucket) (list and initial bucket gets allocated in release as well)
+    // but only when debug utilities are enabled
+    : types(maxTypes + std::max(1ULL, maxTypes) * OVERHEAD(1, 0))
+    , pages(maxPages + std::max(1ULL, maxPages) * OVERHEAD(1, 1))
+    , pageMemories(maxPageMemories)
+    , ptrSafeContainerNodes(maxObjectNodes) // underlying vector uses the new/delete resource for this
+    , lookupNodes(maxObjectLookupNodes + std::max(1ULL, maxObjectLookupNodes) * OVERHEAD(2, 2))
+    , pageAllocations(maxPageAllocations + std::max(1ULL, maxPageAllocations) * OVERHEAD(1, 0))
+    , referencedBy(maxReferencedBy + std::max(1ULL, maxReferencedBy) * OVERHEAD(1, 0)) {}
+#undef OVERHEAD
+#undef GUARANTEED_OVERHEAD
+#undef MAYBE_DEBUG_OVERHEAD
+#else
     : types(maxTypes)
     , pages(maxPages)
     , pageMemories(maxPageMemories)
@@ -143,6 +163,7 @@ struct allocation_failure_test_allocator : gc::gc_allocator {
     , lookupNodes(maxObjectLookupNodes)
     , pageAllocations(maxPageAllocations)
     , referencedBy(maxReferencedBy) {}
+#endif
 
     std::pmr::vector<gc::object_type> CreateTypesVector() noexcept override {
         return std::pmr::vector<gc::object_type>(&types);
@@ -1032,7 +1053,7 @@ TEST(GC_utility__ptr_safe_container__node, does_not_throw_on_out_of_bounds_slot_
     EXPECT_NO_THROW(gc::ptr_safe_container<uint8_t>::node().SetSlotIsFree(64, false));
 }
 
-TEST(GC_utility__ptr_safe_container, does_not_allocates_the_first_node_on_construction) {
+TEST(GC_utility__ptr_safe_container, does_not_allocate_the_first_node_on_construction) {
 #ifdef _MSC_VER
     // Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x86
     // can't do anything about this:
@@ -1043,10 +1064,19 @@ TEST(GC_utility__ptr_safe_container, does_not_allocates_the_first_node_on_constr
     // should fail because std::terminate will be called
     // because the constructor is noexcept
     // actual exit code will be 3
-    EXPECT_EXIT({
+    // best of all, it only does so in debug
+    if (std::is_same_v<std::_Container_base, std::_Container_base12>) {
+        simulated_out_of_storage_resource res{1}; // for the proxy
+        EXPECT_NO_THROW(gc::ptr_safe_container<uint8_t>(&res, &res));
+        // should fail by termination (exit code 3)
+        EXPECT_EXIT({
+            EXPECT_NO_THROW(gc::ptr_safe_container<uint8_t>(std::pmr::null_memory_resource(), std::pmr::null_memory_resource()));
+            std::exit(0);
+        }, testing::ExitedWithCode(3), "");
+    }
+    else {
         EXPECT_NO_THROW(gc::ptr_safe_container<uint8_t>(std::pmr::null_memory_resource(), std::pmr::null_memory_resource()));
-        std::exit(0);
-    }, testing::ExitedWithCode(0), "");
+    }
 #else
     // msvc hates this
     EXPECT_NO_THROW(gc::ptr_safe_container<uint8_t>(std::pmr::null_memory_resource(), std::pmr::null_memory_resource()));
@@ -1112,8 +1142,33 @@ TEST(GC_utility__ptr_safe_container, strong_exception_guarantee_for_allocator_fa
     }
 
     {
+        void *buff = nullptr;
+        size_t buffSize = 0;
+#ifdef _MSC_VER
+        if constexpr (std::is_same_v<std::_Container_base, std::_Container_base12>) {
+            // std::_Container_proxy is what vector allocates on construction
+            constexpr size_t greater_alignment = alignof(void*) > alignof(std::_Container_proxy)
+                                               ? alignof(void*)
+                                               : alignof(std::_Container_proxy);
+            alignas(greater_alignment) std::array<
+                std::byte,
+                sizeof(void *) * 2 + sizeof(std::_Container_proxy) // what vector allocates on construction
+                > buffer {static_cast<std::byte>(0)};
+            buff = buffer.data();
+            buffSize = sizeof(buffer);
+        }
+        else {
+            std::array<void*, 2> buffer{nullptr};
+            buff = buffer.data();
+            buffSize = sizeof(buffer);
+        }
+
+#else
         std::array<void*, 2> buffer{nullptr};
-        auto res = std::pmr::monotonic_buffer_resource(buffer.data(), sizeof(buffer), std::pmr::null_memory_resource());
+        buff = buffer.data();
+        buffSize = sizeof(buffer);
+#endif
+        auto res = std::pmr::monotonic_buffer_resource(buff, buffSize, std::pmr::null_memory_resource());
         auto nodeRes = allocation_tracking_resource();
         auto data = gc::ptr_safe_container<uint8_t>(&nodeRes, &res);
 
@@ -1294,7 +1349,16 @@ TEST(GC_collecting_allocator__page, RemoveAllocation_does_not_remove_invalid_all
 }
 
 TEST(GC_collecting_allocator__gc_impl, constructor_does_not_allocate) {
+#ifdef _MSC_VER
+    if (std::is_same_v<std::_Container_base, std::_Container_base12>) {
+        GTEST_FAIL() << "in msvc's implementation, most containers (including the ons used in the implementation) allocate debug proxies when enabled (and they currently are)";
+    }
+    else {
+        EXPECT_NO_THROW(gc::gc_impl(gc::gc_init_args{gc::GetNullAllocator()}));
+    }
+#else
     EXPECT_NO_THROW(gc::gc_impl(gc::gc_init_args{gc::GetNullAllocator()}));
+#endif
 }
 
 TEST(GC_collecting_allocator__gc_impl, constructor_does_not_accept_null_memory_resource_pointer) {
@@ -1305,8 +1369,8 @@ TEST(GC_collecting_allocator__gc_impl, default_constructor_does_not_throw) {
     EXPECT_EXIT({gc::gc_impl GC{}; std::exit(0);}, testing::ExitedWithCode(0), "");
 }
 
-TEST(GC_collecting_allocator__gc_impl, default_constructor_cannot_allocate) {
-    EXPECT_THROW(gc::gc_impl().Allocate(default_gc_object_type_v<int>, 1), std::bad_alloc);
+TEST(GC_collecting_allocator__gc_impl, default_constructor_can_allocate) {
+    EXPECT_NO_THROW(gc::gc_impl().Allocate(default_gc_object_type_v<int>, 1));
 }
 
 TEST(GC_collecting_allocator__gc_impl, Allocate_count_allocations_are_sequential) {
@@ -1814,6 +1878,116 @@ TEST(GC_assumption, virtual_address_size_is_48) {
     EXPECT_EQ(addressBits, 48);
 }
 
+TEST(GC_assumption, termainate_exit_code_is_3) {
+    EXPECT_EXIT({
+        std::terminate();
+    }, testing::ExitedWithCode(3), "");
+}
+
+TEST(GC_assumption, msvc_vector_allocates_only_the_proxy_during_construction_when_debug_utilities_are_enabled) {
+#ifdef _MSC_VER
+    // std::_Container_proxy is what vector allocates on construction
+    if (std::is_same_v<std::_Container_base, std::_Container_base0>) {
+        GTEST_SKIP() << "debug proxies are not enabled";
+    }
+    else {
+        ASSERT_EXIT({
+            std::_Container_proxy p;
+            auto vectorInitBuffer = std::pmr::monotonic_buffer_resource(&p, sizeof(p) - 1, std::pmr::null_memory_resource());
+            std::pmr::vector<std::byte> vec(&vectorInitBuffer);
+            std::exit(0);
+        }, testing::ExitedWithCode(3), "") << "std::vector allocates less than just an std::_Container_proxy instance on construction";
+
+        ASSERT_EXIT({
+            std::_Container_proxy p;
+            auto vectorInitBuffer = std::pmr::monotonic_buffer_resource(&p, sizeof(p), std::pmr::null_memory_resource());
+            std::pmr::vector<std::byte> vec(&vectorInitBuffer);
+            std::exit(0);
+        }, testing::ExitedWithCode(0), "") << "std::vector allocates more than just an std::_Container_proxy instance on construction";
+    }
+#else
+    GTEST_SKIP() << "not compiling with msvc";
+#endif
+}
+
+TEST(GC_assumption, msvc_list_only_allocates_a_proxy_during_construction) {
+#ifdef _MSC_VER
+    using list = std::pmr::list<int>; // not noexcept
+    struct allocation {
+        std::_Container_proxy _{};
+        // linked list (int) node approximation
+        void * _next{nullptr}, *_prev{nullptr};
+        int _data{0};
+    };
+    if (std::is_same_v<std::_Container_base, std::_Container_base0>) {
+        GTEST_SKIP() << "debug proxies are not enabled";
+    }
+    else {
+        ASSERT_THROW({
+        allocation p;
+        auto initBuffer = std::pmr::monotonic_buffer_resource(&p, sizeof(p) - 1, std::pmr::null_memory_resource());
+        list unorderedMap(&initBuffer);
+    }, std::bad_alloc) << "std::list allocates less than expected on construction";
+        ASSERT_NO_THROW({
+            allocation p;
+            auto initBuffer = std::pmr::monotonic_buffer_resource(&p, sizeof(p), std::pmr::null_memory_resource());
+            list unorderedMap(&initBuffer);
+        }) << "std::list allocates more than expected on construction";
+    }
+#else
+    GTEST_SKIP() << "not compiling with msvc";
+#endif
+}
+
+TEST(GC_assumption, msvc_unordered_map_allocates_only_the_proxy_during_construction) {
+#ifdef _MSC_VER
+    // list + vector allocation
+    // not noexcept (but "explicit _Hash_vec(_Any_alloc&& _Al) noexcept" is)
+    // and then a resize (which will allocate) for the first bucket
+    using unordered_map = std::pmr::unordered_map<int, int>;
+
+    // approximation
+    struct allocation {
+        std::_Container_proxy _pList{};
+        void *_next{nullptr}, *_prev{nullptr};
+        std::pair<int, int> _data{};
+        std::_Container_proxy _pVec{};
+        // bucket size is 8
+        struct {
+            size_t _hash{0};
+            int _key{0};
+            int _value{0};
+        } buckets[8];
+    };
+
+    if (std::is_same_v<std::_Container_base, std::_Container_base0>) {
+        GTEST_SKIP() << "debug proxies are not enabled";
+    }
+    else {
+        simulated_out_of_storage_resource resFail{3};
+        EXPECT_THROW(unordered_map unorderedMap(&resFail), std::bad_alloc);
+        simulated_out_of_storage_resource resSuccess{4};
+        EXPECT_NO_THROW(unordered_map unorderedMap(&resSuccess));
+
+        ASSERT_EXIT({
+            allocation p;
+            auto initBuffer = std::pmr::monotonic_buffer_resource(&p, sizeof(p) - 1, std::pmr::null_memory_resource());
+            EXPECT_THROW(unordered_map unorderedMap(&initBuffer), std::bad_alloc);
+            std::exit(0);
+        }, testing::ExitedWithCode(0), "") << "std::unordered_map allocates less than expected on construction";
+
+        EXPECT_EXIT({
+            allocation p;
+            auto initBuffer = std::pmr::monotonic_buffer_resource(&p, sizeof(p), std::pmr::null_memory_resource());
+            EXPECT_NO_THROW(unordered_map unorderedMap(&initBuffer));
+            std::exit(0);
+        }, testing::ExitedWithCode(0), "") << "std::unordered_map allocates more than expected on construction";
+    }
+#else
+    GTEST_SKIP() << "not compiling with msvc";
+#endif
+}
+
 class ClassA {
     std::vector<int> toMove;
 };
@@ -2201,7 +2375,13 @@ TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_page_nod
         0, // types (vector)
         1, // pages (linked list)
         0, // pages (object memory)
+#ifdef  _MSC_VER
+        std::is_same_v<std::_Container_base, std::_Container_base12> ? 1 : 0, // page allocations (vector)
+        // msvc's vector implementation will allocate a new proxy to exchange in the move constructor
+        // in debug mode
+#else
         0, // page allocations (vector)
+#endif
         0, // object nodes (n * 64)
         0, // lookup (unordered map) (happens before the handle allocation)
         0, // referenced by (vector)
@@ -2223,7 +2403,13 @@ TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_page_all
         0, // types (vector)
         1, // pages (linked list)
         1, // pages (object memory)
+#ifdef  _MSC_VER
+        std::is_same_v<std::_Container_base, std::_Container_base12> ? 1 : 0, // page allocations (vector)
+        // msvc's vector implementation will allocate a new proxy to exchange in the move constructor
+        // in debug mode
+#else
         0, // page allocations (vector)
+#endif
         0, // object nodes (n * 64)
         0, // lookup (unordered map) (happens before the handle allocation)
         0, // referenced by (vector)
@@ -2231,6 +2417,7 @@ TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_page_all
     ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
     gc::defer destroy(&gc::Destroy);
 
+    // same problem as previously (msvc only)
     EXPECT_THROW(gc::New<int>(), std::bad_alloc);
     EXPECT_TRUE(gc::impl->pagesLock.TryAcquireWrite()) << "lock not released";
     gc::impl->pagesLock.Release();
@@ -2331,15 +2518,24 @@ TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_referenc
         2, // types (vector)
         1, // pages (linked list)
         1, // pages (object memory)
+#ifdef _MSC_VER
+        (std::is_same_v<std::_Container_base, std::_Container_base12> ? 1 : 0) + // debug proxy allocation
+#endif
         2, // page allocations (vector)
         1, // object nodes (n * 64)
         3, // lookup (unordered map) (happens before the handle allocation)
+#ifdef  _MSC_VER
+        std::is_same_v<std::_Container_base, std::_Container_base12> ? 2 : 0, // referenced by (vector)
+        // 2 allocations for 2 moves
+#else
         0, // referenced by (vector)
+#endif
     };
     ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
     gc::defer destroy(&gc::Destroy);
 
     gc::root_handle<ClassA> a{};
+    // vector move ctor, courtesy of msvc's implementation
     EXPECT_NO_THROW(a = gc::New<ClassA>());
     EXPECT_THROW(gc::New<ClassB>(a), std::bad_alloc); // will throw in initialization, which happens after object allocation
     EXPECT_EQ(gc::impl->allocationToHandleLookup.size(), 2) << "object that failed to initialize did not become floating garbage";
@@ -2358,6 +2554,11 @@ TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_referenc
 }
 
 int main(int argc, char **argv) {
+#ifdef _MSC_VER
+    // there's something ironic about not having this precisely where I need it
+#else
+    std::set_terminate(__gnu_cxx::__verbose_terminate_handler);
+#endif
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

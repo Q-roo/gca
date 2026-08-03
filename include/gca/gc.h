@@ -12,7 +12,7 @@ namespace gc {
     allocator_handle_t *GetDefaultAllocator();
 
     struct gc_init_args {
-        allocator_handle_t *allocator = GetNullAllocator();
+        allocator_handle_t *allocator = GetDefaultAllocator();
         gc_init_args() noexcept = default;
         explicit gc_init_args(allocator_handle_t *allocator) : allocator(allocator) {
             if (allocator == nullptr) {
