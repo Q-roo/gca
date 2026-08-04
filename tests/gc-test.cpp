@@ -1354,7 +1354,7 @@ TEST(GC_collecting_allocator__gc_impl, constructor_does_not_allocate) {
         GTEST_FAIL() << "in msvc's implementation, most containers (including the ons used in the implementation) allocate debug proxies when enabled (and they currently are)";
     }
     else {
-        EXPECT_NO_THROW(gc::gc_impl(gc::gc_init_args{gc::GetNullAllocator()}));
+        GTEST_FAIL() << "in msvc's implementation, some containers allocate space on construction (e.g.: std::list allocates the first node)";
     }
 #else
     EXPECT_NO_THROW(gc::gc_impl(gc::gc_init_args{gc::GetNullAllocator()}));
@@ -2161,8 +2161,6 @@ TEST(GC_collecting_allocator__public_API, compiles) {
     gc::pin<const ClassB, true> proc3{ClassC<const ClassB>(gc::null_handle).field};
     gc::pin<const ClassB, true> proc4{nullptr};
     gc::pin<const ClassB, true> proc5{gc::null_handle};
-
-    // TODO: tests for move behaviour
 }
 
 TEST(GC_collecting_allocator__public_API, move_does_not_break_invariance) {
@@ -2551,6 +2549,132 @@ TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_referenc
     a.handle->objectLock.Release();
     EXPECT_TRUE(hClassB->objectLock.TryAcquireWrite()) << "lock not released";
     hClassB->objectLock.Release();
+}
+
+class PolymorphicBase { uint64_t _{}; public: virtual ~PolymorphicBase() = default; };
+class PolymorphicDerived : public PolymorphicBase { uint64_t _{}; public: ~PolymorphicDerived() override = default; };
+
+TEST(GC_collecting_allocator__public_API, handle_cast_base_to_base) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    const auto h = gc::impl->Allocate(default_gc_object_type_v<PolymorphicBase>, 1);
+    std::construct_at(reinterpret_cast<PolymorphicDerived *>(h->objectAllocation.data())); // init vtable
+    const gc::polymorphic_handle<PolymorphicBase> hP = h;
+    EXPECT_EQ(static_cast<ptrdiff_t>(hP.handle.GetData()), 0);
+}
+
+TEST(GC_collecting_allocator__public_API, handle_cast_derived_to_base) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    const auto h = gc::impl->Allocate(default_gc_object_type_v<PolymorphicDerived>, 1);
+    const auto original = std::construct_at(reinterpret_cast<PolymorphicDerived *>(h->objectAllocation.data())); // init vtable
+    const auto casted = dynamic_cast<PolymorphicBase*>(original);
+    const gc::polymorphic_handle<PolymorphicDerived> hP = h;
+    const gc::polymorphic_handle<PolymorphicBase> hP2 = hP;
+    EXPECT_EQ(hP.Get(gc::handle_role::ro_pin), original);
+    EXPECT_EQ(hP2.Get(gc::handle_role::ro_pin), casted);
+}
+
+TEST(GC_collecting_allocator__public_API, handle_cast_base_to_derived) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    const auto h = gc::impl->Allocate(default_gc_object_type_v<PolymorphicDerived>, 1);
+    const auto original = std::construct_at(reinterpret_cast<PolymorphicDerived *>(h->objectAllocation.data())); // init vtable
+    const auto casted = dynamic_cast<PolymorphicBase*>(original);
+    const gc::polymorphic_handle<PolymorphicDerived> hP = h;
+    const gc::polymorphic_handle<PolymorphicBase> hP2 = hP;
+    EXPECT_EQ(hP.Get(gc::handle_role::ro_pin), original);
+    EXPECT_EQ(hP2.Get(gc::handle_role::ro_pin), casted);
+}
+
+class Parent1 {uint64_t _{}; virtual void A() = 0;};
+class Parent2 {uint64_t _{}; virtual void B() = 0;};
+class Child : public Parent1, public Parent2 {uint64_t _{}; void A() override {} void B() override {}};
+
+TEST(GC_collecting_allocator__public_API, handle_cast_cross_cast) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    const auto h = gc::impl->Allocate(default_gc_object_type_v<Child>, 1);
+    const auto original = std::construct_at(reinterpret_cast<Child *>(h->objectAllocation.data())); // init vtable
+    const auto casted1 = dynamic_cast<Parent1*>(original);
+    const auto casted2 = dynamic_cast<Parent2*>(casted1);
+    const gc::polymorphic_handle<Child> hP = h;
+    const gc::polymorphic_handle<Parent1> hP1 = hP;
+    const gc::polymorphic_handle<Parent2> hP2 = hP1;
+
+    EXPECT_EQ(hP.Get(gc::handle_role::ro_pin), original);
+    EXPECT_EQ(hP1.Get(gc::handle_role::ro_pin), casted1);
+    EXPECT_EQ(hP2.Get(gc::handle_role::ro_pin), casted2);
+}
+
+class Animal {public: virtual ~Animal() = default;};
+class Dog : virtual public Animal {public: ~Dog() override = default;};
+class Cat : virtual public Animal {public: ~Cat() override = default;};
+class DogCat : public Dog, public Cat {public: ~DogCat() override = default;};
+
+// alternatively
+/*
+ * interface Foo {...}
+ * interface Bar requires Foo {...}
+ * interface Baz requires Foo {...}
+ * class Faz implements Bar, Baz {...}
+ */
+
+TEST(GC_collecting_allocator__public_API, handle_cast_virtual_diamond) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    const auto hDogCat = gc::impl->Allocate(default_gc_object_type_v<DogCat>, 1);
+    const auto dogCat = std::construct_at(std::launder(reinterpret_cast<DogCat *>(hDogCat->objectAllocation.data())));
+    const auto hPDogCat = gc::polymorphic_handle<DogCat>(hDogCat);
+    EXPECT_EQ(hPDogCat.Get(gc::handle_role::ro_pin), dogCat);
+
+    // cast to bases
+    const auto dog = dynamic_cast<Dog*>(dogCat);
+    const auto hPDog = gc::polymorphic_handle<Dog>(hPDogCat);
+    EXPECT_EQ(hPDog.Get(gc::handle_role::ro_pin), dog);
+
+    const auto cat = dynamic_cast<Cat*>(dogCat);
+    const auto hPCat = gc::polymorphic_handle<Cat>(hPDogCat);
+    EXPECT_EQ(hPCat.Get(gc::handle_role::ro_pin), cat);
+
+    const auto animal = dynamic_cast<Animal*>(dogCat); // ambiguous
+    const auto hPAnimal = gc::polymorphic_handle<Animal>(hPDogCat);
+    EXPECT_EQ(hPAnimal.Get(gc::handle_role::ro_pin), animal);
+
+    const auto dAnimal = dynamic_cast<Animal*>(dog);
+    const auto hPDAnimal = gc::polymorphic_handle<Animal>(hPDog);
+    EXPECT_EQ(hPDAnimal.Get(gc::handle_role::ro_pin), dAnimal);
+
+    const auto cAnimal = dynamic_cast<Animal*>(cat);
+    const auto hPCAnimal = gc::polymorphic_handle<Animal>(hPCat);
+    EXPECT_EQ(hPCAnimal.Get(gc::handle_role::ro_pin), cAnimal);
+
+    // cast to sibling/derived
+    const auto dog2D = dynamic_cast<Dog*>(dAnimal);
+    const auto hPDog2D = gc::polymorphic_handle<Dog>(hPDAnimal);
+    EXPECT_EQ(hPDog2D.Get(gc::handle_role::ro_pin), dog2D);
+
+    const auto dog2S = dynamic_cast<Dog*>(cAnimal);
+    const auto hPDog2S = gc::polymorphic_handle<Dog>(hPCAnimal);
+    EXPECT_EQ(hPDog2S.Get(gc::handle_role::ro_pin), dog2S);
+
+    const auto cat2D = dynamic_cast<Cat*>(cAnimal);
+    const auto hPCat2D = gc::polymorphic_handle<Cat>(hPCAnimal);
+    EXPECT_EQ(hPCat2D.Get(gc::handle_role::ro_pin), cat2D);
+
+    const auto cat2S = dynamic_cast<Cat*>(dAnimal);
+    const auto hPCat2S = gc::polymorphic_handle<Cat>(hPDAnimal);
+    EXPECT_EQ(hPCat2S.Get(gc::handle_role::ro_pin), cat2S);
 }
 
 int main(int argc, char **argv) {

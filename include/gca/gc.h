@@ -46,6 +46,9 @@ namespace gc {
         handle_t *LookupObject(const void *obj) noexcept;
         handle_t *GetOwningObject(const void *obj) noexcept;
         handle_t *LookupObjectOrGetOwningObject(const void *obj) noexcept;
+        const std::type_info *GetType(handle_t *obj);
+        void TemporaryROPin(handle_t *handle);
+        void TemporaryUnpin(handle_t *handle);
 
         handle_t *New(
             size_t size,
@@ -96,6 +99,102 @@ namespace gc {
         template <ptrdiff_t field_store_offset, size_t index, class T>
         handle_t *PinRO(const field<field_store_offset, index, T> &field);
     }
+
+    template <class T, class U>
+    concept dynamic_castable_from_u_to_t = requires(U *u) {
+        dynamic_cast<T*>(u);
+    };
+
+    template <class T>
+    struct polymorphic_handle {
+        tagged_ptr<handle_t, int16_t> handle = nullptr;
+        polymorphic_handle() = default;
+        // internal
+        polymorphic_handle(handle_t *handle) {
+            if (handle == nullptr) {
+                return;
+            }
+
+            if (!internal::GetType(handle)->operator==(typeid(T))) {
+                throw library_bug("initial handle type mismatch");
+            }
+
+            this->handle = tagged_ptr(handle, static_cast<int16_t>(0));
+        }
+
+        template <dynamic_castable_from_u_to_t<T> U>
+        polymorphic_handle(const polymorphic_handle<U> &other) {
+            if (other.IsNull()) {
+                return;
+            }
+
+            internal::TemporaryROPin(other.handle.Get());
+            U *original = nullptr;
+            T *casted = nullptr;
+            try {
+                original = other.Get(handle_role::ro_pin);
+                casted = dynamic_cast<T*>(original);
+                internal::TemporaryUnpin(other.handle.Get());
+            } catch (...) {
+                internal::TemporaryUnpin(other.handle.Get());
+            }
+
+            if (casted == nullptr) {
+                return;
+            }
+
+            // const auto diff = reinterpret_cast<intptr_t>(casted)
+            //                          - reinterpret_cast<intptr_t>(original)
+            //                          + static_cast<intptr_t>(other.handle.GetData());
+
+            auto d = intptr_t(casted);
+            auto d2 = d - intptr_t(original);
+            auto d3 = d2 + intptr_t(other.handle.GetData());
+            if (d < d2) {
+                throw std::runtime_error("underflow");
+            }
+            if (d2 > d3) {
+                throw std::runtime_error("overflow");
+            }
+
+            constexpr ptrdiff_t min = std::numeric_limits<int16_t>::min();
+            constexpr ptrdiff_t max = std::numeric_limits<int16_t>::max();
+            if (d3 < min || d3 > max) {
+                throw std::out_of_range("cannot store offset in int16_t");
+            }
+
+            handle = tagged_ptr(other.handle.Get(), static_cast<int16_t>(d3));
+        }
+
+        [[nodiscard]] constexpr bool IsNull() const noexcept {
+            return handle == nullptr;
+        }
+
+        explicit constexpr operator bool() const noexcept {
+            return !IsNull();
+        }
+
+        template <class U>
+        bool operator==(const polymorphic_handle<U> &rhs) const {
+            return internal::Equals(handle.Get(), rhs.handle.Get());
+        }
+
+        bool operator==(std::nullptr_t) const noexcept {
+            return IsNull();
+        }
+
+        bool operator==(null_handle_t) const noexcept {
+            return IsNull();
+        }
+
+        T *Get(const handle_role role) const {
+            if (IsNull()) {
+                return nullptr;
+            }
+
+            return std::launder(reinterpret_cast<T*>(static_cast<std::byte *>(internal::GetInstance(handle.Get(), role)) + handle.GetData()));
+        }
+    };
 
     template <class T>
     struct root_handle {
@@ -551,86 +650,6 @@ namespace gc {
                 // managed mode or indirectly managed
                 internal::SetField(obj, GetField(), nullptr, handle_role::unknown);
             }
-        }
-    };
-
-    // relies on 64 bit pointers and 48-bit canonical space
-    template <class T, class U=uint16_t>
-    struct tagged_ptr {
-        static constexpr uint8_t canonical_address_bits = 48;
-        static constexpr uint64_t pointer_mask = 0x0000FFFFFFFFFFFF;
-
-        T *ptr = nullptr;
-        constexpr tagged_ptr() noexcept = default;
-
-        constexpr tagged_ptr(std::nullptr_t) noexcept {} // already initialized to that
-
-        constexpr tagged_ptr(T *p) noexcept : ptr(p) {}
-
-        constexpr tagged_ptr(T *p, U data={}) noexcept : ptr(p) {
-            Pack(data);
-        }
-
-        constexpr void Pack(const U data) noexcept requires(!std::is_same_v<U, uint16_t>) {
-            Pack(std::bit_cast<uint16_t>(data));
-        }
-
-        constexpr void Pack(const uint16_t data) noexcept {
-            ptr = reinterpret_cast<T *>((static_cast<uint64_t>(data) << canonical_address_bits) |
-                                        (reinterpret_cast<uint64_t>(ptr) & pointer_mask));
-        }
-
-        constexpr U GetData() const noexcept {
-            return std::bit_cast<U>(static_cast<uint16_t>(reinterpret_cast<uint64_t>(ptr) >> canonical_address_bits));
-        }
-
-        constexpr T *Get() const noexcept {
-            auto masked = reinterpret_cast<uint64_t>(ptr) & pointer_mask;
-#if __x86_64__ || _M_X64
-            // set all top bits to ones if 47th bit is enabled
-            // (sign-extending)
-            constexpr uint64_t sign_bit = 1ULL << 47ULL;
-            constexpr uint64_t sign_extension_bits = 0xFFFF000000000000ULL;
-            if (masked & sign_bit) {
-                masked |= sign_extension_bits;
-            }
-
-            return reinterpret_cast<T *>(masked);
-#endif
-        }
-
-        constexpr void Set(T* ptr) noexcept {
-            uint16_t data = GetData();
-            this->ptr = ptr;
-            Pack(data);
-        }
-
-        constexpr T* operator->() const noexcept {
-            return Get();
-        }
-
-        constexpr std::add_lvalue_reference_t<T> operator*() const noexcept {
-            return *Get();
-        }
-
-        constexpr bool operator==(const tagged_ptr &other) const noexcept {
-            return Get() == other.Get();
-        }
-
-        constexpr bool operator!=(const tagged_ptr &other) const noexcept {
-            return Get() != other.Get();
-        }
-
-        constexpr bool operator==(std::nullptr_t) const noexcept {
-            return Get() == nullptr;
-        }
-
-        constexpr bool operator!=(std::nullptr_t) const noexcept {
-            return Get() != nullptr;
-        }
-
-        constexpr operator bool() const noexcept {
-            return static_cast<bool>(Get());
         }
     };
 

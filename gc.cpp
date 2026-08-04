@@ -1016,6 +1016,25 @@ namespace gc {
             return nullptr;
         }
 
+        const std::type_info *GetType(handle_t *obj) {
+            if (obj == nullptr) {
+                return nullptr;
+            }
+
+            scoped_rw_lock lockTypes(impl->typesLock);
+            return impl->types[obj->objectType].type;
+        }
+
+        void TemporaryROPin(handle_t *handle) {
+            handle->objectLock.AcquireRead();
+            ++handle->rootHandleCount;
+        }
+
+        void TemporaryUnpin(handle_t *handle) {
+            handle->objectLock.Release();
+            --handle->rootHandleCount;
+        }
+
         handle_t *New(
             const size_t size,
             const size_t alignment,
