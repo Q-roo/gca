@@ -719,4 +719,13 @@ namespace gc {
             return static_cast<bool>(Get());
         }
     };
+
+    // std::unreachable is c++ 23
+    [[noreturn]] inline void Unreachable() {
+#ifdef _MSC_VER
+        __assume(false);
+#else
+        __builtin_unreachable();
+#endif
+    }
 }

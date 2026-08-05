@@ -619,7 +619,8 @@ namespace gc {
         if constexpr (config::enable_debug_messages) {
             debugListeners.onAllocateReturningNull(this);
         }
-        return nullptr; // should get a std::bad_alloc before getting here
+        // should get a std::bad_alloc before getting here
+        Unreachable();
     }
 
     type_index gc_impl::GetOrRegisterType(const object_type &type) noexcept(false) {
@@ -860,7 +861,7 @@ namespace gc {
             }
 
             switch (srcRole) {
-                case handle_role::unknown:
+                case handle_role::internal_initialization:
                     if (dstRole != handle_role::root) {
                         throw bad_api_usage("this operation is only meant to be used for creating a root handle from a newly allocated handle");
                     }
@@ -916,8 +917,8 @@ namespace gc {
                 throw library_bug("obj is nullptr");
             }
 
-            const auto needsUpgrade = newValueRole == handle_role::ro_pin && newValue != nullptr;
-            if (needsUpgrade) {
+            const auto needsUpgrade = newValueRole == handle_role::ro_pin;
+            if (needsUpgrade && newValue != nullptr) {
                 newValue->objectLock.Upgrade();
             }
             defer downgrade([=]{ if (needsUpgrade) { newValue->objectLock.DownGrade(); } });
@@ -1016,7 +1017,7 @@ namespace gc {
             return nullptr;
         }
 
-        const std::type_info *GetType(handle_t *obj) {
+        const std::type_info *GetType(const handle_t *obj) {
             if (obj == nullptr) {
                 return nullptr;
             }

@@ -167,91 +167,129 @@ namespace gc {
             }
         };
 
-        using on_allocation_request_callback                                      = void (*)(const callback_data &data, const object_type &type, size_t count);
-        using on_before_pages_lock_acquire_for_begin_and_end_query_callback       = void (*)(const callback_data& data);
-        using on_pages_begin_and_end_query_finished_callback                      = void (*)(const callback_data &data, std::pmr::list<page>::iterator begin, std::pmr::list<page>::iterator end);
-        using on_before_page_lock_acquire_callback                                = void (*)(const callback_data &data);
-        using on_page_allocation_attempt_callback                                 = void (*)(const callback_data &data, size_t size, size_t alignment, page_allocation result);
-        using on_before_register_type_lock_ro_acquire_callback                    = void (*)(const callback_data &data, const object_type &type);
-        using on_before_register_types_ro_lock_upgrade_callback                   = void (*)(const callback_data &data, const object_type &type);
-        using on_before_register_object_types_ro_lock_acquire_callback            = void (*)(const callback_data &data, page_allocation allocation, type_index type);
-        using on_before_register_object_lookup_rw_lock_acquire_callback           = void (*)(const callback_data &data, page_allocation allocation, type_index type);
-        using on_object_registered_callback                                       = void (*)(const callback_data &data, internal_handle *handle);
-        using on_register_object_failed_callback                                  = void (*)(const callback_data &data, page_allocation allocation);
-        using on_allocate_returning_null_callback                                 = void (*)(const callback_data &data);
-        using on_before_allocation_to_handle_lookup_ro_lock_acquire_callback      = void (*)(const callback_data &data, const void *allocation);
-        using on_before_collection_start_callback                                 = void (*)(const callback_data &data, page &page);
-        using on_collection_start_callback                                        = void (*)(const callback_data &data, page &page);
-        using on_collection_finished_callback                                     = void (*)(const callback_data &data, page &page);
-        using on_before_collection_ro_lock_acquire_callback                       = void (*)(const callback_data &data, internal_handle *handle);
-        using on_before_collection_ro_lock_upgrade_callback                       = void (*)(const callback_data &data, internal_handle *handle);
-        using on_before_destroy_object_allocation_lookup_rw_lock_acquire_callback = void (*)(const callback_data &data, internal_handle *handle);
-        using on_before_destroy_object_types_ro_lock_acquire_callback             = void (*)(const callback_data &data, internal_handle *handle);
-        using on_before_destroy_object_field_old_value_acquire_rw_lock_callback   = void (*)(const callback_data &data, internal_handle *handle, internal_handle *fieldOldValue, size_t fieldIndex);
-        using on_before_object_destroyed_callback                                 = void (*)(const callback_data &data, internal_handle *handle);
-        using on_after_object_destroyed_callback                                  = void (*)(const callback_data &data, internal_handle *invalidHandle);
-        using on_object_destroy_failed_callback                                   = void (*)(const callback_data &data, internal_handle *handle);
-        using on_before_find_root_referenced_by_ro_lock_acquire_callback          = void (*)(const callback_data &data, internal_handle *handle, internal_handle *referencedBy);
-        using on_defragment_started_callback                                      = void (*)(const callback_data &data, page &page);
-        using on_defragment_finished_callback                                        = void (*)(const callback_data &data, page &page);
-        using on_before_defragment_page_types_ro_lock_acquire_callback            = void (*)(const callback_data &data, internal_handle *handle);
-        using on_before_defragment_page_object_rw_lock_try_acquire_callback       = void (*)(const callback_data &data, internal_handle *handle);
-        using on_before_defragment_page_lookup_lock_rw_acquire_callback           = void (*)(const callback_data &data, internal_handle *handle);
-        using on_before_defragment_object_relocate_callback                       = void (*)(const callback_data &data, internal_handle *handle, void *newLocation);
-        using on_before_new_page_allocation_lock_acquire_callback                 = void (*)(const callback_data &data);
-        using on_before_new_page_pages_lock_rw_acquire_callback                   = void (*)(const callback_data &data);
-        using on_new_page_page_created_callback                                   = void (*)(const callback_data &data, page &page, bool acquireLockByDefault);
-        using on_before_page_destroyed_callback                                   = void (*)(const callback_data &data, page &page);
-        using on_before_destructor_object_rw_lock_acquire_callback                = void (*)(const callback_data &data, internal_handle *handle);
+        using on_allocation_request_signature                                      = void (const callback_data &data, const object_type &type, size_t count);
+        using on_before_pages_lock_acquire_for_begin_and_end_query_signature       = void (const callback_data& data);
+        using on_pages_begin_and_end_query_finished_signature                      = void (const callback_data &data, std::pmr::list<page>::iterator begin, std::pmr::list<page>::iterator end);
+        using on_before_page_lock_acquire_signature                                = void (const callback_data &data);
+        using on_page_allocation_attempt_signature                                 = void (const callback_data &data, size_t size, size_t alignment, page_allocation result);
+        using on_before_register_type_lock_ro_acquire_signature                    = void (const callback_data &data, const object_type &type);
+        using on_before_register_types_ro_lock_upgrade_signature                   = void (const callback_data &data, const object_type &type);
+        using on_before_register_object_types_ro_lock_acquire_signature            = void (const callback_data &data, page_allocation allocation, type_index type);
+        using on_before_register_object_lookup_rw_lock_acquire_signature           = void (const callback_data &data, page_allocation allocation, type_index type);
+        using on_object_registered_signature                                       = void (const callback_data &data, internal_handle *handle);
+        using on_register_object_failed_signature                                  = void (const callback_data &data, page_allocation allocation);
+        using on_allocate_returning_null_signature                                 = void (const callback_data &data);
+        using on_before_allocation_to_handle_lookup_ro_lock_acquire_signature      = void (const callback_data &data, const void *allocation);
+        using on_before_collection_start_signature                                 = void (const callback_data &data, page &page);
+        using on_collection_start_signature                                        = void (const callback_data &data, page &page);
+        using on_collection_finished_signature                                     = void (const callback_data &data, page &page);
+        using on_before_collection_ro_lock_acquire_signature                       = void (const callback_data &data, internal_handle *handle);
+        using on_before_collection_ro_lock_upgrade_signature                       = void (const callback_data &data, internal_handle *handle);
+        using on_before_destroy_object_allocation_lookup_rw_lock_acquire_signature = void (const callback_data &data, internal_handle *handle);
+        using on_before_destroy_object_types_ro_lock_acquire_signature             = void (const callback_data &data, internal_handle *handle);
+        using on_before_destroy_object_field_old_value_acquire_rw_lock_signature   = void (const callback_data &data, internal_handle *handle, internal_handle *fieldOldValue, size_t fieldIndex);
+        using on_before_object_destroyed_signature                                 = void (const callback_data &data, internal_handle *handle);
+        using on_after_object_destroyed_signature                                  = void (const callback_data &data, internal_handle *invalidHandle);
+        using on_object_destroy_failed_signature                                   = void (const callback_data &data, internal_handle *handle);
+        using on_before_find_root_referenced_by_ro_lock_acquire_signature          = void (const callback_data &data, internal_handle *handle, internal_handle *referencedBy);
+        using on_defragment_started_signature                                      = void (const callback_data &data, page &page);
+        using on_defragment_finished_signature                                     = void (const callback_data &data, page &page);
+        using on_before_defragment_page_types_ro_lock_acquire_signature            = void (const callback_data &data, internal_handle *handle);
+        using on_before_defragment_page_object_rw_lock_try_acquire_signature       = void (const callback_data &data, internal_handle *handle);
+        using on_before_defragment_page_lookup_lock_rw_acquire_signature           = void (const callback_data &data, internal_handle *handle);
+        using on_before_defragment_object_relocate_signature                       = void (const callback_data &data, internal_handle *handle, void *newLocation);
+        using on_before_new_page_allocation_lock_acquire_signature                 = void (const callback_data &data);
+        using on_before_new_page_pages_lock_rw_acquire_signature                   = void (const callback_data &data);
+        using on_new_page_page_created_signature                                   = void (const callback_data &data, page &page, bool acquireLockByDefault);
+        using on_before_page_destroyed_signature                                   = void (const callback_data &data, page &page);
+        using on_before_destructor_object_rw_lock_acquire_signature                = void (const callback_data &data, internal_handle *handle);
 
         struct debug_listeners {
-            std::function<std::remove_pointer_t<on_allocation_request_callback>>                                      onAllocation{[](const callback_data&, const object_type&, size_t){}};
-            std::function<std::remove_pointer_t<on_before_pages_lock_acquire_for_begin_and_end_query_callback>>       onBeforePagesQuery{[](const callback_data&){}};
-            std::function<std::remove_pointer_t<on_pages_begin_and_end_query_finished_callback>>                      onPagesQueryFinished{[](const callback_data&, std::pmr::list<page>::iterator, std::pmr::list<page>::iterator){}};
-            std::function<std::remove_pointer_t<on_before_page_lock_acquire_callback>>                                onBeforePageLockAcquire{[](const callback_data&){}};
-            std::function<std::remove_pointer_t<on_page_allocation_attempt_callback>>                                 onPageAllocationAttempt{[](const callback_data&, size_t, size_t, page_allocation){}};
-            std::function<std::remove_pointer_t<on_before_register_type_lock_ro_acquire_callback>>                    onBeforeRegisterTypeROLockAcquire{[](const callback_data&, const object_type&){}};
-            std::function<std::remove_pointer_t<on_before_register_types_ro_lock_upgrade_callback>>                   onBeforeRegisterTypeLockUpgrade{[](const callback_data&, const object_type&){}};
-            std::function<std::remove_pointer_t<on_before_register_object_types_ro_lock_acquire_callback>>            onBeforeRegisterObjectTypesROLockAcquire{[](const callback_data&, page_allocation, type_index){}};
-            std::function<std::remove_pointer_t<on_before_register_object_lookup_rw_lock_acquire_callback>>           onBeforeRegisterObjectLookupRWLockAcquire{[](const callback_data&, page_allocation, type_index){}};
-            std::function<std::remove_pointer_t<on_object_registered_callback>>                                       onObjectRegistered{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_register_object_failed_callback>>                                  onObjectRegisterFailed{[](const callback_data&, page_allocation){}};
-            std::function<std::remove_pointer_t<on_allocate_returning_null_callback>>                                 onAllocateReturningNull{[](const callback_data&){}};
-            std::function<std::remove_pointer_t<on_before_allocation_to_handle_lookup_ro_lock_acquire_callback>>      onBeforeAllocationToHandleLookupROLockAcquire{[](const callback_data&, const void*){}};
-            std::function<std::remove_pointer_t<on_before_collection_start_callback>>                                 onBeforeCollectionStart{[](const callback_data&, page&){}};
-            std::function<std::remove_pointer_t<on_collection_start_callback>>                                        onCollectionStart{[](const callback_data&, page&){}};
-            std::function<std::remove_pointer_t<on_collection_finished_callback>>                                     onCollectionFinished{[](const callback_data&, page&){}};
-            std::function<std::remove_pointer_t<on_before_collection_ro_lock_acquire_callback>>                       onBeforeCollectionROLockAcquire{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_before_collection_ro_lock_upgrade_callback>>                       onBeforeCollectionROLockUpgrade{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_before_destroy_object_allocation_lookup_rw_lock_acquire_callback>> onBeforeDestroyObjectAllocationLookupRWLockAcquire{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_before_destroy_object_types_ro_lock_acquire_callback>>             onBeforeDestroyObjectTypesROLockAcquire{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_before_destroy_object_field_old_value_acquire_rw_lock_callback>>   onBeforeDestroyObjectFieldOldValueRWLockAcquire{[](const callback_data&, internal_handle*, internal_handle*, size_t){}};
-            std::function<std::remove_pointer_t<on_before_object_destroyed_callback>>                                 onBeforeObjectDestroyed{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_after_object_destroyed_callback>>                                  onAfterObjectDestroyed{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_object_destroy_failed_callback>>                                   onObjectDestroyFailed{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_before_find_root_referenced_by_ro_lock_acquire_callback>>          onBeforeFindRootReferencedByROLockAcquire{[](const callback_data&, internal_handle*, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_defragment_started_callback>>                                      onDefragmentStarted{[](const callback_data&, page&){}};
-            std::function<std::remove_pointer_t<on_defragment_finished_callback>>                                     onDefragmentFinished{[](const callback_data&, page&){}};
-            std::function<std::remove_pointer_t<on_before_defragment_page_types_ro_lock_acquire_callback>>            onBeforeDefragmentPageTypesROLockAcquire{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_before_defragment_page_object_rw_lock_try_acquire_callback>>       onBeforeDefragmentPageObjectRWLockTryAcquire{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_before_defragment_page_lookup_lock_rw_acquire_callback>>           onBeforeDefragmentPageLookupRWAcquire{[](const callback_data&, internal_handle*){}};
-            std::function<std::remove_pointer_t<on_before_defragment_object_relocate_callback>>                       onBeforeDefragmentObjectRelocate{[](const callback_data&, internal_handle*, void*){}};
-            std::function<std::remove_pointer_t<on_before_new_page_allocation_lock_acquire_callback>>                 onBeforeNewPageAllocationLockAcquire{[](const callback_data&){}};
-            std::function<std::remove_pointer_t<on_before_new_page_pages_lock_rw_acquire_callback>>                   onBeforeNewPagePagesRWLockAcquire{[](const callback_data&){}};
-            std::function<std::remove_pointer_t<on_new_page_page_created_callback>>                                   onNewPageCreated{[](const callback_data&, page&, bool){}};
-            std::function<std::remove_pointer_t<on_before_page_destroyed_callback>>                                   onBeforePageDestroyed{[](const callback_data&, page&){}};
-            std::function<std::remove_pointer_t<on_before_destructor_object_rw_lock_acquire_callback>>                onBeforeDestructorObjectRWLockAcquire{[](const callback_data&, internal_handle*){}};
+            std::function<on_allocation_request_signature>                                      onAllocation                                       {[](auto&&...){}};
+            std::function<on_before_pages_lock_acquire_for_begin_and_end_query_signature>       onBeforePagesQuery                                 {[](auto&&...){}};
+            std::function<on_pages_begin_and_end_query_finished_signature>                      onPagesQueryFinished                               {[](auto&&...){}};
+            std::function<on_before_page_lock_acquire_signature>                                onBeforePageLockAcquire                            {[](auto&&...){}};
+            std::function<on_page_allocation_attempt_signature>                                 onPageAllocationAttempt                            {[](auto&&...){}};
+            std::function<on_before_register_type_lock_ro_acquire_signature>                    onBeforeRegisterTypeROLockAcquire                  {[](auto&&...){}};
+            std::function<on_before_register_types_ro_lock_upgrade_signature>                   onBeforeRegisterTypeLockUpgrade                    {[](auto&&...){}};
+            std::function<on_before_register_object_types_ro_lock_acquire_signature>            onBeforeRegisterObjectTypesROLockAcquire           {[](auto&&...){}};
+            std::function<on_before_register_object_lookup_rw_lock_acquire_signature>           onBeforeRegisterObjectLookupRWLockAcquire          {[](auto&&...){}};
+            std::function<on_object_registered_signature>                                       onObjectRegistered                                 {[](auto&&...){}};
+            std::function<on_register_object_failed_signature>                                  onObjectRegisterFailed                             {[](auto&&...){}};
+            std::function<on_allocate_returning_null_signature>                                 onAllocateReturningNull                            {[](auto&&...){}};
+            std::function<on_before_allocation_to_handle_lookup_ro_lock_acquire_signature>      onBeforeAllocationToHandleLookupROLockAcquire      {[](auto&&...){}};
+            std::function<on_before_collection_start_signature>                                 onBeforeCollectionStart                            {[](auto&&...){}};
+            std::function<on_collection_start_signature>                                        onCollectionStart                                  {[](auto&&...){}};
+            std::function<on_collection_finished_signature>                                     onCollectionFinished                               {[](auto&&...){}};
+            std::function<on_before_collection_ro_lock_acquire_signature>                       onBeforeCollectionROLockAcquire                    {[](auto&&...){}};
+            std::function<on_before_collection_ro_lock_upgrade_signature>                       onBeforeCollectionROLockUpgrade                    {[](auto&&...){}};
+            std::function<on_before_destroy_object_allocation_lookup_rw_lock_acquire_signature> onBeforeDestroyObjectAllocationLookupRWLockAcquire {[](auto&&...){}};
+            std::function<on_before_destroy_object_types_ro_lock_acquire_signature>             onBeforeDestroyObjectTypesROLockAcquire            {[](auto&&...){}};
+            std::function<on_before_destroy_object_field_old_value_acquire_rw_lock_signature>   onBeforeDestroyObjectFieldOldValueRWLockAcquire    {[](auto&&...){}};
+            std::function<on_before_object_destroyed_signature>                                 onBeforeObjectDestroyed                            {[](auto&&...){}};
+            std::function<on_after_object_destroyed_signature>                                  onAfterObjectDestroyed                             {[](auto&&...){}};
+            std::function<on_object_destroy_failed_signature>                                   onObjectDestroyFailed                              {[](auto&&...){}};
+            std::function<on_before_find_root_referenced_by_ro_lock_acquire_signature>          onBeforeFindRootReferencedByROLockAcquire          {[](auto&&...){}};
+            std::function<on_defragment_started_signature>                                      onDefragmentStarted                                {[](auto&&...){}};
+            std::function<on_defragment_finished_signature>                                     onDefragmentFinished                               {[](auto&&...){}};
+            std::function<on_before_defragment_page_types_ro_lock_acquire_signature>            onBeforeDefragmentPageTypesROLockAcquire           {[](auto&&...){}};
+            std::function<on_before_defragment_page_object_rw_lock_try_acquire_signature>       onBeforeDefragmentPageObjectRWLockTryAcquire       {[](auto&&...){}};
+            std::function<on_before_defragment_page_lookup_lock_rw_acquire_signature>           onBeforeDefragmentPageLookupRWAcquire              {[](auto&&...){}};
+            std::function<on_before_defragment_object_relocate_signature>                       onBeforeDefragmentObjectRelocate                   {[](auto&&...){}};
+            std::function<on_before_new_page_allocation_lock_acquire_signature>                 onBeforeNewPageAllocationLockAcquire               {[](auto&&...){}};
+            std::function<on_before_new_page_pages_lock_rw_acquire_signature>                   onBeforeNewPagePagesRWLockAcquire                  {[](auto&&...){}};
+            std::function<on_new_page_page_created_signature>                                   onNewPageCreated                                   {[](auto&&...){}};
+            std::function<on_before_page_destroyed_signature>                                   onBeforePageDestroyed                              {[](auto&&...){}};
+            std::function<on_before_destructor_object_rw_lock_acquire_signature>                onBeforeDestructorObjectRWLockAcquire              {[](auto&&...){}};
         };
     }
 
+    /**
+     * @brief An interface for memory allocations for the gc
+     */
     struct gc_allocator {
+        /**
+         * @brief Create the vector used by the implementation to hold the registered types
+         * @return The type vector
+         */
         virtual std::pmr::vector<object_type> CreateTypesVector() noexcept = 0;
+
+        /**
+         * @brief Create the list that stores the existing pages
+         * @return The page list
+         */
         virtual std::pmr::list<page> CreatePagesList()  noexcept = 0;
+
+        /**
+         * @brief Create an allocator used to allocate the memory for pages
+         * @return The allocator
+         */
         virtual std::pmr::polymorphic_allocator<page_memory> CreatePageMemoryAllocator() noexcept = 0;
+
+        /**
+         * @brief Create the container used to store the handles for allocations
+         * @return The handle container
+         */
         virtual ptr_safe_container<internal_handle> CreateObjectHandlesContainer()  noexcept= 0;
+
+        /**
+         * @brief Create the lookup for memory allocations to handles for them
+         * @return The lookup
+         */
         virtual std::pmr::unordered_map<const void*, internal_handle*> CreateAllocationToHandleLookup()  noexcept = 0;
+
+        /**
+         * @brief The vector used to store the allocations made on a page
+         * @return The allocations vector
+         */
         virtual std::pmr::vector<page::allocation> CreatePageAllocationsVectorForPage()  noexcept = 0;
+
+        /**
+         * @brief Create the vector used by the handle to track which other handles reference it
+         * @return The vector to store references to a handle
+         */
         virtual std::pmr::vector<internal_handle*> CreateReferencedByVectorForHandle()  noexcept = 0;
+
         virtual ~gc_allocator() = default;
     };
 
@@ -276,7 +314,7 @@ namespace gc {
         /**
          * @brief constructs a gc_impl that cannot allocate
          *
-         * construction with gc_init_args where objectMemory and backingMemory is set to std::pmr::null_memory_resource
+         * construction with gc_init_args where the allocator is set to the default allocator
          */
         gc_impl() noexcept;
         explicit gc_impl(const gc_init_args &args);
@@ -293,7 +331,7 @@ namespace gc {
          * @param type The type of the object
          * @param count The number of instances
          * @return A handle to the allocated instances
-         * @throws ... Anything that the underlying memory_resource might throw (mainly std::bad_alloc)
+         * @throws ... Anything that the underlying memory allocator containers might throw (mainly std::bad_alloc)
          * @throws std::out_of_range When registering the type failed due to the resulting index being larger than what
          * type_index can hold
          * @note This only allocates space for the object (which it will track), but it won't initialize it.
@@ -357,11 +395,13 @@ namespace gc {
          * @note If the allocation is an array allocation, then each object of the array will be destroyed individually
          * @note The object (or objects in the cases of arrays) will only be destroyed if they have been initialized.
          * @note Object(s) that have attempted and failed to initialize will still be destroyed.
+         * @note Every field (that the collector is aware of) will be set to null before the destructor is called.
+         * (field only refers to field handles)
          */
         void DestroyObject(page &page, internal_handle *handle) noexcept(false);
         bool TryFindRootFor(internal_handle *handle, thread_count id) noexcept(true);
-        internal_handle *TryGetHandleForObjectAllocation(const void *objAllocation) noexcept(true);
-        internal_handle *GetHandleForObjectAllocation(const void *objAllocation) noexcept(false);
+        internal_handle *TryGetHandleForObjectAllocation(const void *objAllocation) noexcept(true); // can return nullptr
+        internal_handle *GetHandleForObjectAllocation(const void *objAllocation) noexcept(false); // throws instead of returning nullptr
 
         /**
          * @brief registers an allocation to the garbage collector
@@ -373,10 +413,51 @@ namespace gc {
          * @return A handle to the allocation
          */
         internal_handle *RegisterObject(page_allocation allocation, type_index type) noexcept(false);
+
+        /**
+         * @brief Allocates @p count instances of an object of @p type on a new page and returns a handle to the allocation
+         *
+         * Requests a new page and allocates @p count instances of objects of @p type in a continuous region
+         * @param type The type of the object
+         * @param count The number of instances
+         * @return A handle to the allocation
+         * @note The implementation should throw before letting this return a null handle
+         * @throws ... Anything that the allocator and containers might throw
+         */
         internal_handle *TryAllocateOnNewPage(const object_type &type, size_t count) noexcept(false);
+
+        /**
+         * @brief Gets the type index for the type or registers and then returns the registered index
+         * @param type The type to get the index for
+         * @return An index that can be used to access the type
+         * @throws std::out_of_range If the value of the index for the type cannot fit into the type_index
+         */
         type_index GetOrRegisterType(const object_type &type) noexcept(false);
+
+        /**
+         * @brief Requests a new page
+         *
+         * Requests a new page and initializes it
+         *
+         * @param acquireLock Defer the unlocking of the page to the caller
+         * @return A new empty page
+         * @throws ... Anything that the allocator might throw
+         */
         page &NewPage(bool acquireLock = false) noexcept(false);
+
+        /**
+         * @brief Initialize a newly created page
+         * @param page The page to initialize
+         * @throws ... Anything the allocator might throw
+         * @note This is a separate step to ensure proper clean-up in the implementation if anything throws
+         */
         void InitPage(page &page) noexcept(false);
+
+        /**
+         * @brief Deallocates the memory of a page
+         * @param page The page to destroy
+         * @note This will not ensure nor check whether the objects allocated on this page have been cleaned up properly
+         */
         void DestroyPage(page &page) noexcept(true);
 
         /**

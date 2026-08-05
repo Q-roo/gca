@@ -1,16 +1,15 @@
-#include <memory_resource>
-
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
 #include <cpuid.h>
 #endif
 #include <ranges>
+#include <memory_resource>
+
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
 #include <gca/gc-internal.h>
-#include <gca/gc.h>
 
 #ifdef _MSC_VER
 #define no_unique_address msvc::no_unique_address
@@ -1193,12 +1192,8 @@ TEST(GC_utility__ptr_safe_container, object_destructor_gets_called_only_once) {
 }
 
 template<>
-struct gc::gc_object_traits<int> {
-    constexpr static bool supported = true;
-    constexpr static get_field_count_fn get_field_count = [](const void*) noexcept -> size_t{ return 0; };
-    constexpr static get_field_fn get_field = [](void*, size_t) noexcept -> handle_t**{ return nullptr; };
-    constexpr static move_fn move = [](void *obj, void *newLocation) noexcept { *(int*)newLocation = *(int*)obj;}; // trivial
-    constexpr static destructor_fn destructor = [](void*) noexcept {}; // trivial
+struct gc::is_gc_supported<int> {
+    static constexpr bool supported = true;
 };
 
 template <class T>
@@ -1207,15 +1202,10 @@ struct default_gc_object_type {
         .size = sizeof(T),
         .alignment = alignof(T),
         .type = &typeid(T), // static storage duration
-        .destructor = [](void *obj) noexcept { if constexpr (std::is_destructible_v<T>) {
-            std::destroy_at<T>(static_cast<T *>(obj));
-        }},
-        .getFieldCount = [](const void*) noexcept -> size_t {return 0;},
-        .getField = [](void*, size_t) noexcept -> gc::internal_handle** {return nullptr;},
-        .move = [](void *obj, void *newLocation) noexcept {
-            *(T*)newLocation = std::move(*(T*)obj);
-        }
-            //static_cast<gc::move_fn>(nullptr) // FIXME: pointers and move do not play nice with each other
+        .destructor = gc::default_destroy<T>,
+        .getFieldCount = gc::default_get_field_count<T>,
+        .getField = gc::default_get_field<T>,
+        .move = gc::default_move<T>
     };
 };
 
@@ -2004,26 +1994,22 @@ class ClassB {
     ClassB(const gc::field<field_store_offset, index, ClassA> &f) : a{f} {}
 };
 
-template <> struct gc::gc_object_traits<ClassA> {
-    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 0; };
-    static constexpr get_field_fn get_field = [](void*,size_t) noexcept -> internal_handle** { return nullptr; };
-    static constexpr move_fn move = [](void* obj, void* newLocation) noexcept {
-        ClassA &a = *static_cast<ClassA *>(obj), &newA = *static_cast<ClassA *>(newLocation);
-        std::construct_at(&newA, std::move(a));
-    };
-    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassA *>(obj)); };
+template <> struct gc::is_gc_supported<ClassA> {
     static constexpr bool supported = true;
 };
 
-template <> struct gc::gc_object_traits<ClassB> {
-    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 1; };
-    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return idx == 0 ? static_cast<ClassB *>(obj)->a.GetField() : nullptr; };
-    static constexpr move_fn move = [](void* obj, void* newLocation) noexcept {
-        ClassB &b = *static_cast<ClassB *>(obj), &newB = *static_cast<ClassB *>(newLocation);
-        std::construct_at(&newB, std::move(b));
-    };
-    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassB *>(obj)); };
+template <> struct gc::is_gc_supported<ClassB> {
     static constexpr bool supported = true;
+};
+
+template <> struct gc::partial_gc_object_traits<ClassB> {
+    using type = ClassB;
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept { return 1ULL; };
+    static constexpr get_field_fn get_field = [](void*obj, const size_t idx) noexcept -> internal_handle** {
+        return idx == 0
+        ? std::launder(static_cast<ClassB*>(obj))->a.GetField()
+        : nullptr;
+    };
 };
 
 template<class T>
@@ -2049,15 +2035,18 @@ public:
     ClassC(const gc::field<offset, index, std::remove_const_t<T>> &f) requires(std::is_const_v<T>) :field(f) {}
 };
 
-template <class T> struct gc::gc_object_traits<ClassC<T>> {
-    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 1; };
-    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return idx == 0 ? static_cast<ClassC<T> *>(obj)->field.GetField() : nullptr; };
-    static constexpr move_fn move = [](void* obj, void* newLocation) noexcept {
-        ClassB &b = *static_cast<ClassB *>(obj), &newB = *static_cast<ClassB *>(newLocation);
-        std::construct_at(&newB, std::move(b));
-    };
-    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassB *>(obj)); };
+template <class T> struct gc::is_gc_supported<ClassC<T>> {
     static constexpr bool supported = true;
+};
+
+template <class T> struct gc::partial_gc_object_traits<ClassC<T>> {
+    using type = ClassC<T>;
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 1ULL; };
+    static constexpr get_field_fn get_field = [](void *obj, const size_t idx) noexcept -> internal_handle** {
+        return idx == 0
+        ? std::launder(static_cast<ClassC<T>*>(obj))->field.GetField()
+        : nullptr;
+    };
 };
 
 TEST(GC_collecting_allocator__public_API, compiles) {
@@ -2221,36 +2210,30 @@ public:
     ClassG g{};
 };
 
-template <> struct gc::gc_object_traits<ClassH> {
-    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 0; };
-    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return nullptr; };
-    static constexpr move_fn move = nullptr; // don't care for these tests
-    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassH *>(obj)); };
+template <> struct gc::is_gc_supported<ClassH> {
     static constexpr bool supported = true;
 };
 
-template <> struct gc::gc_object_traits<ClassF> {
-    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 0; };
-    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return nullptr; };
-    static constexpr move_fn move = nullptr; // don't care for these tests
-    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassF *>(obj)); };
+template <> struct gc::is_gc_supported<ClassF> {
     static constexpr bool supported = true;
 };
 
-template <> struct gc::gc_object_traits<ClassE> {
-    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 0; };
-    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return nullptr; };
-    static constexpr move_fn move = nullptr; // don't care for these tests
-    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassE *>(obj)); };
+template <> struct gc::is_gc_supported<ClassE> {
     static constexpr bool supported = true;
 };
 
-template <> struct gc::gc_object_traits<ClassD> {
-    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 1; };
-    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** { return idx == 0 ? static_cast<ClassD *>(obj)->field.GetField() : nullptr; };
-    static constexpr move_fn move = nullptr; // don't care
-    static constexpr destructor_fn destructor = [](void *obj) noexcept { std::destroy_at(static_cast<ClassD *>(obj)); };
+template <> struct gc::is_gc_supported<ClassD> {
     static constexpr bool supported = true;
+};
+
+template <> struct gc::partial_gc_object_traits<ClassD> {
+    using type = ClassD;
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept { return 1ULL; };
+    static constexpr get_field_fn get_field = [](void *obj, size_t idx) noexcept -> internal_handle** {
+        return idx == 0
+        ? std::launder(static_cast<ClassD *>(obj))->field.GetField()
+        : nullptr;
+    };
 };
 
 namespace gc {
@@ -2544,7 +2527,7 @@ TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_referenc
         }
     }
     ASSERT_NE(hClassB, nullptr);
-    EXPECT_FALSE(gc::internal::Equals(*gc::gc_object_traits<ClassB>::get_field(hClassB->objectAllocation.data(), 0), a.handle)) << "field assignment not rolled back";
+    EXPECT_FALSE(gc::internal::Equals(*gc::partial_gc_object_traits<ClassB>::get_field(hClassB->objectAllocation.data(), 0), a.handle)) << "field assignment not rolled back";
     EXPECT_TRUE(a.handle->objectLock.TryAcquireWrite()) << "lock not released";
     a.handle->objectLock.Release();
     EXPECT_TRUE(hClassB->objectLock.TryAcquireWrite()) << "lock not released";
