@@ -927,7 +927,7 @@ namespace gc {
             return newValue;
         }
 
-        bool Equals(const handle_t *lhs, const handle_t *rhs) {
+        bool Equals(const handle_t *lhs, const handle_t *rhs) noexcept {
             return lhs == rhs;
         }
 
@@ -1017,7 +1017,7 @@ namespace gc {
             return nullptr;
         }
 
-        const std::type_info *GetType(const handle_t *obj) {
+        const std::type_info *GetType(const handle_t *obj) noexcept {
             if (obj == nullptr) {
                 return nullptr;
             }

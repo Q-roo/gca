@@ -68,15 +68,15 @@ namespace gc {
          * @param rhs The right-hand side
          * @return Whether @p lhs points to the same object as @p rhs
          */
-        bool Equals(const handle_t *lhs, const handle_t *rhs);
+        bool Equals(const handle_t *lhs, const handle_t *rhs) noexcept;
 
-        void Destroy(handle_t *handle, handle_role role);
+        void Destroy(handle_t *handle, handle_role role); // can handle nullptr for handle
         void *GetInstance(const handle_t *handle, handle_role role); // should only be called with a pin(ro/rw) role
         size_t GetMemberCount(const handle_t *array);
         handle_t *LookupObject(const void *obj) noexcept;
         handle_t *GetOwningObject(const void *obj) noexcept;
         handle_t *LookupObjectOrGetOwningObject(const void *obj) noexcept;
-        const std::type_info *GetType(const handle_t *obj);
+        const std::type_info *GetType(const handle_t *obj) noexcept; // returns the type of std::nullptr_t if obj is nullptr
         void TemporaryROPin(handle_t *handle); // used for dynamic handles only as a "temporary" solution
         void TemporaryUnpin(handle_t *handle); // ^ same thing
 
@@ -175,112 +175,6 @@ namespace gc {
         template <ptrdiff_t field_store_offset, size_t index, class T>
         handle_t *PinRO(const field<field_store_offset, index, T> &field);
     }
-
-    template <class T, class U>
-    concept dynamic_castable_from_u_to_t = requires(U *u) {
-        dynamic_cast<T*>(u);
-    };
-
-    template <class T>
-    struct polymorphic_handle {
-        tagged_ptr<handle_t, int16_t> handle = nullptr;
-        polymorphic_handle() = default;
-        polymorphic_handle(std::nullptr_t) {}
-        polymorphic_handle(null_handle_t) {}
-        // internal
-        polymorphic_handle(handle_t *handle) {
-            if (handle == nullptr) {
-                return;
-            }
-
-            if (!internal::GetType(handle)->operator==(typeid(T))) {
-                throw library_bug("initial handle type mismatch");
-            }
-
-            this->handle = tagged_ptr(handle, static_cast<int16_t>(0));
-        }
-
-        template <dynamic_castable_from_u_to_t<T> U>
-        polymorphic_handle(const polymorphic_handle<U> &other) {
-            if (other.IsNull()) {
-                return;
-            }
-
-            internal::TemporaryROPin(other.handle.Get());
-            U *original = nullptr;
-            T *casted = nullptr;
-            try {
-                original = other.Get(handle_role::ro_pin);
-                casted = dynamic_cast<T*>(original);
-                internal::TemporaryUnpin(other.handle.Get());
-            } catch (...) {
-                internal::TemporaryUnpin(other.handle.Get());
-            }
-
-            if (casted == nullptr) {
-                return;
-            }
-
-            // const auto diff = reinterpret_cast<intptr_t>(casted)
-            //                          - reinterpret_cast<intptr_t>(original)
-            //                          + static_cast<intptr_t>(other.handle.GetData());
-
-            const auto d = reinterpret_cast<intptr_t>(casted);
-            const auto d2 = d - reinterpret_cast<intptr_t>(original);
-            const auto d3 = d2 + static_cast<intptr_t>(other.handle.GetData());
-            if (d < d2) {
-                throw std::runtime_error("underflow");
-            }
-            if (d2 > d3) {
-                throw std::runtime_error("overflow");
-            }
-
-            constexpr ptrdiff_t min = std::numeric_limits<int16_t>::min();
-            constexpr ptrdiff_t max = std::numeric_limits<int16_t>::max();
-            if (d3 < min || d3 > max) {
-                throw std::out_of_range("cannot store offset in int16_t");
-            }
-
-            handle = tagged_ptr(other.handle.Get(), static_cast<int16_t>(d3));
-        }
-
-        [[nodiscard]] constexpr bool IsNull() const noexcept {
-            return handle == nullptr;
-        }
-
-        explicit constexpr operator bool() const noexcept {
-            return !IsNull();
-        }
-
-        template <class U>
-        bool operator==(const polymorphic_handle<U> &rhs) const {
-            return internal::Equals(handle.Get(), rhs.handle.Get());
-        }
-
-        bool operator==(std::nullptr_t) const noexcept {
-            return IsNull();
-        }
-
-        bool operator==(null_handle_t) const noexcept {
-            return IsNull();
-        }
-
-        T *Get(const handle_role role) const {
-            if (IsNull()) {
-                return nullptr;
-            }
-
-            return std::launder(reinterpret_cast<T*>(static_cast<std::byte *>(internal::GetInstance(handle.Get(), role)) + handle.GetData()));
-        }
-
-        [[nodiscard]] const std::type_info &GetType() const noexcept {
-            if (IsNull()) {
-                return typeid(std::nullptr_t);
-            }
-
-            return *internal::GetType(handle.Get());
-        }
-    };
 
     template <class T>
     struct root_handle {
@@ -438,12 +332,12 @@ namespace gc {
         constexpr pin() noexcept = default;
         constexpr pin(std::nullptr_t) noexcept {}
         constexpr pin(null_handle_t) noexcept {}
-        pin(const root_handle<rw_element_type> &handle) : handle(ro ? PinRO(handle) : PinRW(handle)) {}
+        pin(const root_handle<rw_element_type[]> &handle) : handle(ro ? PinRO(handle) : PinRW(handle)) {}
         template <ptrdiff_t field_store_offset, size_t index>
-        pin(const field<field_store_offset, index, rw_element_type> &field) : handle(ro ? PinRO(field) : PinRW(field)) {}
-        pin(const root_handle<ro_element_type> &handle) : handle(PinRO(handle)) {}
+        pin(const field<field_store_offset, index, rw_element_type[]> &field) : handle(ro ? PinRO(field) : PinRW(field)) {}
+        pin(const root_handle<ro_element_type[]> &handle) : handle(PinRO(handle)) {}
         template <ptrdiff_t field_store_offset, size_t index>
-        pin(const field<field_store_offset, index, ro_element_type> &field) : handle(PinRO(field)) {}
+        pin(const field<field_store_offset, index, ro_element_type[]> &field) : handle(PinRO(field)) {}
 
         pin(const pin&) = delete;
         pin& operator=(const pin&) = delete;
@@ -827,6 +721,737 @@ namespace gc {
         }
     }
 
+    // unlike regular field, root and pin handles, the handles here are able to handle polymorphism
+    namespace dyn {
+        template <class T, class U>
+        concept dynamic_castable_from_u_to_t = requires(U *u) {
+            dynamic_cast<T*>(u);
+        };
+
+        template <class T>
+        struct polymorphic_handle {
+            tagged_ptr<handle_t, int16_t> handle = nullptr;
+            constexpr polymorphic_handle() = default;
+            constexpr polymorphic_handle(std::nullptr_t) {}
+            constexpr polymorphic_handle(null_handle_t) {}
+            // internal
+            polymorphic_handle(handle_t *handle) {
+                if (handle == nullptr) {
+                    return;
+                }
+
+                if (!internal::GetType(handle)->operator==(typeid(T))) {
+                    throw library_bug("initial handle type mismatch");
+                }
+
+                this->handle = tagged_ptr(handle, static_cast<int16_t>(0));
+            }
+            // internal
+            constexpr polymorphic_handle(handle_t *handle, const int16_t offset) : handle(handle, offset) {}
+
+            template <dynamic_castable_from_u_to_t<T> U>
+            polymorphic_handle(const polymorphic_handle<U> &other) {
+                if (other.IsNull()) {
+                    return;
+                }
+
+                internal::TemporaryROPin(other.handle.Get());
+                U *original = nullptr;
+                T *casted = nullptr;
+                try {
+                    original = other.Get(handle_role::ro_pin);
+                    casted = dynamic_cast<T*>(original);
+                    internal::TemporaryUnpin(other.handle.Get());
+                } catch (...) {
+                    internal::TemporaryUnpin(other.handle.Get());
+                }
+
+                if (casted == nullptr) {
+                    return;
+                }
+
+                // const auto diff = reinterpret_cast<intptr_t>(casted)
+                //                          - reinterpret_cast<intptr_t>(original)
+                //                          + static_cast<intptr_t>(other.handle.GetData());
+
+                const auto d = reinterpret_cast<intptr_t>(casted);
+                const auto d2 = d - reinterpret_cast<intptr_t>(original);
+                const auto d3 = d2 + static_cast<intptr_t>(other.handle.GetData());
+                if (d < d2) {
+                    throw std::runtime_error("underflow");
+                }
+                if (d2 > d3) {
+                    throw std::runtime_error("overflow");
+                }
+
+                constexpr ptrdiff_t min = std::numeric_limits<int16_t>::min();
+                constexpr ptrdiff_t max = std::numeric_limits<int16_t>::max();
+                if (d3 < min || d3 > max) {
+                    throw std::out_of_range("cannot store offset in int16_t");
+                }
+
+                handle = tagged_ptr(other.handle.Get(), static_cast<int16_t>(d3));
+            }
+
+            [[nodiscard]] constexpr bool IsNull() const noexcept {
+                return handle == nullptr;
+            }
+
+            explicit constexpr operator bool() const noexcept {
+                return !IsNull();
+            }
+
+            template <class U>
+            [[nodiscard]] bool operator==(const polymorphic_handle<U> &rhs) const noexcept {
+                return internal::Equals(handle.Get(), rhs.handle.Get());
+            }
+
+            [[nodiscard]] constexpr bool operator==(std::nullptr_t) const noexcept {
+                return IsNull();
+            }
+
+            [[nodiscard]] constexpr bool operator==(null_handle_t) const noexcept {
+                return IsNull();
+            }
+
+            [[nodiscard]] T *Get(const handle_role role) const {
+                if (IsNull()) {
+                    return nullptr;
+                }
+
+                return std::launder(reinterpret_cast<T*>(static_cast<std::byte *>(internal::GetInstance(handle.Get(), role)) + handle.GetData()));
+            }
+
+            [[nodiscard]] const std::type_info &GetType() const noexcept {
+                if (IsNull()) {
+                    return typeid(std::nullptr_t);
+                }
+
+                return *internal::GetType(handle.Get());
+            }
+        };
+
+        template <class T>
+        class root_handle;
+
+        template <class T, bool ro = std::is_const_v<T>>
+        class pin;
+
+        template <class T>
+        class field;
+
+        template <class From>
+        polymorphic_handle<void /* replace with the type of To handle */ > GetHandle(const From&) {
+            // implement this via template specialization
+            // do not execute the internal copying
+            return nullptr;
+        }
+
+        // TODO: equality operators
+
+        template <class T, bool ro>
+        class pin {
+            static_assert(ro || !std::is_const_v<T>, "cannot create read-write pin for const T");
+
+            friend auto GetHandle<>(const pin&);
+        public:
+            constexpr static handle_role role = ro ? handle_role::ro_pin : handle_role::rw_pin;
+
+            using element_type = T;
+            using rw_element_type = std::remove_const_t<T>;
+            using ro_element_type = std::add_const_t<T>;
+            using return_element_type = std::conditional_t<ro, ro_element_type, rw_element_type>;
+            using return_pointer_type = std::add_pointer_t<return_element_type>;
+        private:
+            polymorphic_handle<return_element_type> value{nullptr};
+        public:
+            pin() = delete;
+            pin(const pin &) = delete;
+            pin(pin &&) = delete;
+            pin &operator=(const pin &) = delete;
+            pin &operator=(pin &&) = delete;
+
+            pin(const gc::root_handle<rw_element_type> &handle) : value(handle.handle) {}
+
+            pin(const gc::root_handle<ro_element_type> &handle) requires(ro) : value(handle.handle) {}
+
+            template <ptrdiff_t field_store_offset, size_t index>
+            pin(const gc::field<field_store_offset, index, rw_element_type> &handle) : value(handle.handle) {}
+
+            template <ptrdiff_t field_store_offset, size_t index>
+            pin(const gc::field<field_store_offset, index, ro_element_type> &handle) requires(ro) : value(handle.handle) {}
+
+            template <class U>
+            pin(const root_handle<std::remove_const_t<U>> &handle) {
+                value = GetHandle(handle);
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::root, role));
+            }
+
+            template <class U>
+            pin(const root_handle<const U> &handle) requires(ro) {
+                value = GetHandle(handle);
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::root, role));
+            }
+
+            template <class U>
+            pin(const field<std::remove_const_t<U>> &field) {
+                value = GetHandle(field);
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::field, role));
+            }
+
+            template <class U>
+            pin(const field<const U> &field) requires(ro) {
+                value = GetHandle(field);
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::field, role));
+            }
+
+            [[nodiscard]] constexpr bool IsNull() const noexcept {
+                return value.IsNull();
+            }
+
+            [[nodiscard]] const std::type_info &GetType() const noexcept {
+                return value.GetType();
+            }
+
+            constexpr operator bool() const noexcept {
+                return !IsNull();
+            }
+
+            return_pointer_type Get() const {
+                return value.Get();
+            }
+
+            return_pointer_type operator ->() const {
+                return Get();
+            }
+
+            std::add_lvalue_reference_t<return_element_type> operator *() const {
+                return *Get();
+            }
+
+            template <class U>
+            [[nodiscard]] bool Equals(const U &rhs) const noexcept {
+                return value == GetHandle(rhs);
+            }
+
+            [[nodiscard]] bool Equals(std::nullptr_t) const noexcept {
+                return IsNull();
+            }
+
+            [[nodiscard]] bool Equals(null_handle_t) const noexcept {
+                return IsNull();
+            }
+
+            template <class U>
+            bool operator==(const U &rhs) const noexcept {
+                return Equals(rhs);
+            }
+
+            template <class U>
+            bool operator!=(const U &rhs) const noexcept {
+                return !Equals(rhs);
+            }
+
+            ~pin() {
+                internal::Destroy(value.handle.Get(), role);
+            }
+        };
+
+        template <class T, bool ro>
+        class pin<T[], ro> {
+            static_assert(ro || !std::is_const_v<T>, "cannot create read-write pin for const T");
+
+            friend auto GetHandle<>(const pin&);
+        public:
+            constexpr static handle_role role = ro ? handle_role::ro_pin : handle_role::rw_pin;
+
+            using element_type = T;
+            using rw_element_type = std::remove_const_t<T>;
+            using ro_element_type = std::add_const_t<T>;
+            using return_element_type = std::conditional_t<ro, ro_element_type, rw_element_type>;
+            using return_pointer_type = std::add_pointer_t<return_element_type>;
+        private:
+            polymorphic_handle<return_element_type> value{nullptr};
+        public:
+            pin() = delete;
+            pin(const pin &) = delete;
+            pin(pin &&) = delete;
+            pin &operator=(const pin &) = delete;
+            pin &operator=(pin &&) = delete;
+
+            pin(const gc::root_handle<rw_element_type[]> &handle) : value(handle.handle) {}
+
+            pin(const gc::root_handle<ro_element_type[]> &handle) requires(ro) : value(handle.handle) {}
+
+            template <ptrdiff_t field_store_offset, size_t index>
+            pin(const gc::field<field_store_offset, index, rw_element_type[]> &handle) : value(handle.handle) {}
+
+            template <ptrdiff_t field_store_offset, size_t index>
+            pin(const gc::field<field_store_offset, index, ro_element_type[]> &handle) requires(ro) : value(handle.handle) {}
+
+            template <class U>
+            pin(const root_handle<std::remove_const_t<U>> &handle) {
+                value = GetHandle(handle);
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::root, role));
+            }
+
+            template <class U>
+            pin(const root_handle<const U> &handle) requires(ro) {
+                value = GetHandle(handle);
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::root, role));
+            }
+
+            template <class U>
+            pin(const field<std::remove_const_t<U>> &field) {
+                value = GetHandle(field);
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::field, role));
+            }
+
+            template <class U>
+            pin(const field<const U> &field) requires(ro) {
+                value = GetHandle(field);
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::field, role));
+            }
+
+            [[nodiscard]] constexpr bool IsNull() const noexcept {
+                return value.IsNull();
+            }
+
+            [[nodiscard]] const std::type_info &GetType() const noexcept {
+                return value.GetType();
+            }
+
+            constexpr operator bool() const noexcept {
+                return !IsNull();
+            }
+
+            [[nodiscard]] size_t Count() const {
+                return internal::GetMemberCount(value.handle.Get());
+            }
+
+            return_pointer_type Get() const {
+                return value.Get();
+            }
+
+            return_pointer_type operator ->() const {
+                return Get();
+            }
+
+            std::add_lvalue_reference_t<return_element_type> operator *() const {
+                return *Get();
+            }
+
+            std::add_lvalue_reference_t<element_type> operator[](const size_t index) const {
+                return Get()[index];
+            }
+
+            template <class U>
+            [[nodiscard]] bool Equals(const U &rhs) const noexcept {
+                return value == GetHandle(rhs);
+            }
+
+            [[nodiscard]] bool Equals(std::nullptr_t) const noexcept {
+                return IsNull();
+            }
+
+            [[nodiscard]] bool Equals(null_handle_t) const noexcept {
+                return IsNull();
+            }
+
+            template <class U>
+            bool operator==(const U &rhs) const noexcept {
+                return Equals(rhs);
+            }
+
+            template <class U>
+            bool operator!=(const U &rhs) const noexcept {
+                return !Equals(rhs);
+            }
+
+            ~pin() {
+                internal::Destroy(value.handle.Get(), role);
+            }
+        };
+
+        template <class T>
+        class root_handle {
+            friend auto GetHandle<>(const root_handle&);
+
+            polymorphic_handle<T> value{nullptr};
+
+            template <class U>
+            void Assign(polymorphic_handle<U> newValue, const handle_role newValueRole) {
+                if (newValue == value) {
+                    return;
+                }
+
+                auto oldHandle = value.handle.Get();
+                value = polymorphic_handle<T>(newValue);
+                // actually copy the handle
+                value.handle.Set(internal::Copy(value.handle.Get(), newValueRole, handle_role::root));
+                internal::Destroy(oldHandle, handle_role::root);
+            }
+
+        public:
+            root_handle() = default;
+            root_handle(std::nullptr_t) {}
+            root_handle(null_handle_t) {}
+
+            root_handle(const gc::root_handle<T> &other) {
+                Assign(other.handle, handle_role::root);
+            }
+
+            template <bool ro>
+            root_handle(gc::pin<T, ro> &&pin) {
+                Assign(pin.handle, pin.role);
+            }
+
+            template <bool ro>
+            root_handle(gc::pin<std::remove_const_t<T>, ro> &&pin) requires(std::is_const_v<T>) {
+                Assign(pin.handle, pin.role);
+            }
+
+            template <ptrdiff_t field_store_offset, size_t index>
+            root_handle(const gc::field<field_store_offset, index, T> &field) {
+                Assign(field.handle, handle_role::field);
+            }
+
+            root_handle(const root_handle &other) {
+                Assign(other.value, handle_role::root);
+            }
+
+            template <class U>
+            root_handle(const root_handle<U> &other) {
+                Assign(other.value, handle_role::root);
+            }
+
+            template <class U, bool ro>
+            root_handle(pin<U, ro> &&pin) {
+                Assign(GetHandle(pin), pin.role);
+            }
+
+            template <class U>
+            root_handle(const field<U> &field) {
+                Assign(GetHandle(field), handle_role::field);
+            }
+
+            root_handle(root_handle &&other) noexcept /* won't throw if there are no bugs */ {
+                Assign(other.value, handle_role::root);
+                other.Assign(nullptr, handle_role::root);
+            }
+
+            template <class U>
+            root_handle(root_handle<U> &&other) {
+                Assign(other.value, handle_role::root);
+                other.Assign(nullptr, handle_role::root);
+            }
+
+            root_handle &operator=(std::nullptr_t) {
+                Assign(nullptr, handle_role::internal_initialization);
+                return *this;
+            }
+
+            root_handle &operator=(null_handle_t) {
+                Assign(nullptr, handle_role::internal_initialization);
+                return *this;
+            }
+
+            root_handle &operator=(const root_handle &other) {
+                if (&other == this) {
+                    return *this;
+                }
+
+                Assign(other.value, handle_role::root);
+                return *this;
+            }
+
+            template <class U>
+            root_handle &operator=(const root_handle<U> &other) {
+                Assign(other.value, handle_role::root);
+                return *this;
+            }
+
+            template <class U, bool ro>
+            root_handle &operator=(pin<U, ro> &&pin) {
+                Assign(GetHandle(pin), pin.role);
+                return *this;
+            }
+
+            template <class U>
+            root_handle &operator=(const field<U> &field) {
+                Assign(GetHandle(field), handle_role::field);
+                return *this;
+            }
+
+            root_handle &operator=(root_handle &&other) noexcept /* won't throw if there are no bugs */ {
+                Assign(other.value, handle_role::root);
+                other.Assign(nullptr, handle_role::root);
+                return *this;
+            }
+
+            template <class U>
+            root_handle &operator=(root_handle<U> &&other) {
+                Assign(other.value, handle_role::root);
+                other.Assign(nullptr, handle_role::root);
+                return *this;
+            }
+
+            [[nodiscard]] constexpr bool IsNull() const noexcept {
+                return value.IsNull();
+            }
+
+            [[nodiscard]] const std::type_info &GetType() const noexcept {
+                return value.GetType();
+            }
+
+            constexpr operator bool() const noexcept {
+                return !IsNull();
+            }
+
+            template <class U>
+            [[nodiscard]] bool Equals(const U &rhs) const noexcept {
+                return value == GetHandle(rhs);
+            }
+
+            [[nodiscard]] bool Equals(std::nullptr_t) const noexcept {
+                return IsNull();
+            }
+
+            [[nodiscard]] bool Equals(null_handle_t) const noexcept {
+                return IsNull();
+            }
+
+            template <class U>
+            bool operator==(const U &rhs) const noexcept {
+                return Equals(rhs);
+            }
+
+            template <class U>
+            bool operator!=(const U &rhs) const noexcept {
+                return !Equals(rhs);
+            }
+
+            pin<T, true> Pin() const {
+                return pin<T, true>(*this);
+            }
+
+            pin<T, false> Pin() requires(!std::is_const_v<T>) {
+                return pin<T, false>(*this);
+            }
+
+            ~root_handle() {
+                internal::Destroy(value.handle.Get(), handle_role::root);
+            }
+        };
+
+        template <class T>
+        class field {
+            friend auto GetHandle<>(const field&);
+
+            handle_t *const obj{nullptr}; // the object this field belongs to
+            handle_t *value{nullptr}; // the value of the field
+            uint16_t offset{0}; // cannot use polymorphic_handle here because fields neet to expose a handle_t**
+
+            template <class U>
+            void Assign(polymorphic_handle<U> newValue, const handle_role newValueRole) {
+                polymorphic_handle<T> handle(newValue);
+                offset = handle.handle.GetData();
+                if (obj == nullptr) {
+                    // unmanaged
+                    value = internal::Copy(newValue.handle.Get(), newValueRole, handle_role::root);
+                }
+                else {
+                    // managed
+                    internal::SetField(obj, &value, newValue.handle.Get(), newValueRole);
+                }
+            }
+
+            constexpr polymorphic_handle<T> GetDynamicHandle() const noexcept {
+                return polymorphic_handle<T>(value, offset);
+            }
+
+            [[nodiscard]] constexpr handle_role GetHandleRole() const noexcept {
+                return obj == nullptr ? handle_role::root : handle_role::field;
+            }
+        public:
+            field() noexcept : obj(internal::LookupObjectOrGetOwningObject(this)) {}
+            field(std::nullptr_t) noexcept : field() {}
+            field(null_handle_t) noexcept : field() {}
+
+            field(const gc::root_handle<T> &handle) : field() {
+                Assign(handle.handle, handle_role::root);
+            }
+
+            template <bool ro>
+            field(gc::pin<T, ro> &&pin) : field() {
+                Assign(pin.handle, pin.role);
+            }
+
+            template <bool ro>
+            field(gc::pin<std::remove_const_t<T>, ro> &&pin) requires(std::is_const_v<T>) : field() {
+                Assign(pin.handle, pin.role);
+            }
+
+            template <ptrdiff_t field_store_offset, size_t index>
+            field(const gc::field<field_store_offset, index, T> &other) : field() {
+                Assign(other.handle, handle_role::field);
+            }
+
+            template <class U>
+            field(const root_handle<U> &handle) : field() {
+                Assign(GetHandle(handle), handle_role::root);
+            }
+
+            template <class U, bool ro>
+            field(pin<U, ro> &&pin) : field() {
+                Assign(GetHandle(pin), pin.role);
+            }
+
+            field(const field &other) : field() {
+                Assign(other.GetDynamicHandle(), other.GetHandleRole());
+            }
+
+            template <class U>
+            field(const field<U> &other) : field() {
+                Assign(other.GetDynamicHandle(), other.GetHandleRole());
+            }
+
+            field(field &&other) noexcept /* Assign could throw, but shouldn't if everything is correct */ : field() {
+                Assign(other.GetDynamicHandle(), other.GetHandleRole());
+                other.Assign(nullptr, handle_role::field);
+            }
+
+            template <class U>
+            field(field<U> &&other) : field() {
+                Assign(other.GetDynamicHandle(), other.GetHandleRole());
+                other.Assign(nullptr, handle_role::field);
+            }
+
+            field &operator=(std::nullptr_t) {
+                Assign(nullptr, handle_role::internal_initialization);
+                return *this;
+            }
+
+            field &operator=(null_handle_t) {
+                Assign(nullptr, handle_role::internal_initialization);
+                return *this;
+            }
+
+            template <class U>
+            field &operator=(const root_handle<U> &handle) {
+                Assign(GetHandle(handle), handle_role::root);
+                return *this;
+            }
+
+            template <class U, bool ro>
+            field &operator=(pin<U, ro> &&pin) {
+                Assign(GetHandle(pin), pin.role);
+                return *this;
+            }
+
+            field &operator=(const field &other) {
+                if (&other == this) {
+                    return *this;
+                }
+
+                Assign(other.GetDynamicHandle(), other.GetHandleRole());
+                return *this;
+            }
+
+            template <class U>
+            field &operator=(const field<U> &other) {
+                Assign(other.GetDynamicHandle(), other.GetHandleRole());
+                return *this;
+            }
+
+            field &operator=(field &&other) noexcept /* Assign could throw, but shouldn't if everything is correct */ {
+                if (&other == this) {
+                    return *this;
+                }
+
+                Assign(other.GetDynamicHandle(), other.GetHandleRole());
+                other.Assign(nullptr, handle_role::field);
+                return *this;
+            }
+
+            template <class U>
+            field &operator=(field<U> &&other) {
+                Assign(other.GetDynamicHandle(), other.GetHandleRole());
+                other.Assign(nullptr, handle_role::field);
+                return *this;
+            }
+
+            [[nodiscard]] constexpr bool IsNull() const noexcept {
+                return value == nullptr;
+            }
+
+            [[nodiscard]] const std::type_info &GetType() const noexcept {
+                return GetDynamicHandle().GetType();
+            }
+
+            constexpr operator bool() const noexcept {
+                return !IsNull();
+            }
+
+            template <class U>
+            [[nodiscard]] bool Equals(const U &rhs) const noexcept {
+                return value == GetHandle(rhs);
+            }
+
+            [[nodiscard]] bool Equals(std::nullptr_t) const noexcept {
+                return IsNull();
+            }
+
+            [[nodiscard]] bool Equals(null_handle_t) const noexcept {
+                return IsNull();
+            }
+
+            template <class U>
+            bool operator==(const U &rhs) const noexcept {
+                return Equals(rhs);
+            }
+
+            template <class U>
+            bool operator!=(const U &rhs) const noexcept {
+                return !Equals(rhs);
+            }
+
+            pin<T, true> Pin() const {
+                return pin<T, true>(*this);
+            }
+
+            pin<T, false> Pin() requires(!std::is_const_v<T>) {
+                return pin<T, false>(*this);
+            }
+
+            ~field() {
+                if (obj == nullptr) {
+                    // unmanaged
+                    internal::Destroy(value, handle_role::root);
+                }
+                else {
+                    // managed
+                    internal::SetField(obj, &value, nullptr, handle_role::field);
+                }
+            }
+        };
+
+        template <class T>
+        polymorphic_handle<T> GetHandle(const root_handle<T> &handle) noexcept {
+            return handle.value;
+        }
+
+        template <class T>
+        polymorphic_handle<T> GetHandle(const field<T> &field) noexcept {
+            return field.GetDynamicHandle();
+        }
+
+        template <class T, bool ro>
+        polymorphic_handle<typename pin<T, ro>::return_element_type> GetHandle(const pin<T, ro> &pin) noexcept {
+            return pin.value;
+        }
+    }
+
     // assumes object has no gc fields
     template <class T>
     constexpr inline get_field_count_fn default_get_field_count = [](auto...) noexcept {return 0ULL;};
@@ -1027,7 +1652,7 @@ namespace gc {
      * @tparam InitMemberFn A callable that takes in a @tp T pointer to the member and the index of the member (size_t)
      * @param instance The uninitialized array instance
      * @param initMember The initializer function
-    * @return Whether the initialization attempt was valid
+     * @return Whether the initialization attempt was valid
      * @note If the instance is already or is being initialized, then the call does not initialize the instance a second
      * time and returns false
      * @throws ... Anything that the @p initMember could throw
