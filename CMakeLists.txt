@@ -31,6 +31,17 @@ else()
     target_compile_options(gca PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 
+add_executable(gca.examples.basic)
+target_sources(gca.examples.basic PRIVATE examples/basic.cpp)
+target_link_libraries(gca.examples.basic PRIVATE gca::gca)
+
+add_executable(gca.examples.fields)
+target_sources(gca.examples.fields PRIVATE examples/fields.cpp)
+target_link_libraries(gca.examples.fields PRIVATE gca::gca)
+
+add_executable(gca.examples.dyn)
+target_sources(gca.examples.dyn PRIVATE examples/dyn.cpp)
+target_link_libraries(gca.examples.dyn PRIVATE gca::gca)
 
 include(FetchContent)
 FetchContent_Declare(
