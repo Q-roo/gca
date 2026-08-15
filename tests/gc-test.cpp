@@ -2675,13 +2675,13 @@ TEST(GC_collecting_allocator__public_API, dyn_api_pin_types) {
     EXPECT_TYPE(decltype(ro_pin().operator->()), const int*);
     EXPECT_TYPE(decltype(ro_pin().operator*()), const int&);
 
-    // EXPECT_TYPE(decltype(rw_array_pin().Get()), int*);
-    // EXPECT_TYPE(decltype(rw_array_pin().operator[](0)), int&);
-    // EXPECT_TYPE(decltype(rw_array_pin().Count()), size_t);
-    //
-    // EXPECT_TYPE(decltype(ro_array_pin().Get()), const int*);
-    // EXPECT_TYPE(decltype(ro_array_pin().operator[](0)), const int&);
-    // EXPECT_TYPE(decltype(ro_array_pin().Count()), size_t);
+    EXPECT_TYPE(decltype(rw_array_pin().Get()), int*);
+    EXPECT_TYPE(decltype(rw_array_pin().operator[](0)), int&);
+    EXPECT_TYPE(decltype(rw_array_pin().Count()), size_t);
+
+    EXPECT_TYPE(decltype(ro_array_pin().Get()), const int*);
+    EXPECT_TYPE(decltype(ro_array_pin().operator[](0)), const int&);
+    EXPECT_TYPE(decltype(ro_array_pin().Count()), size_t);
 }
 
 class DClassA {

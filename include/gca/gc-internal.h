@@ -8,7 +8,7 @@
 
 #include "gc-config.h"
 #include "gc-util.h"
-#include "gca/gc.h"
+#include "gc.h"
 
 namespace gc {
     struct object_type {
