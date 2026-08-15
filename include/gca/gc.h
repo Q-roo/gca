@@ -4,6 +4,8 @@
 #include <typeindex>
 #include <utility>
 
+#include "gc-exceptions.h"
+
 namespace gc {
     typedef struct internal_handle handle_t;
     typedef struct gc_allocator allocator_handle_t;
