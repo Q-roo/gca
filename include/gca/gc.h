@@ -3,6 +3,8 @@
 #include <memory>
 #include <typeindex>
 #include <utility>
+#include <limits>
+#include <array>
 
 #include "gc-exceptions.h"
 
@@ -410,11 +412,10 @@ namespace gc {
         unsized_field_store store;
         std::array<handle_t*, field_count> fields{nullptr};
         field_store() :store(fields.data()) {}
-        // move and copy should be a noop
+        // move and copy:
         // the operation itself happens inside the fields
-        // not sure whether using {} would be the same as =default, so I put an empty lambda being called inside
-        field_store(const field_store&) { []{}(); }
-        field_store(field_store&&) noexcept { store.fields = fields.data(); } // should've just relied on array decay
+        field_store(const field_store&) noexcept : field_store() { }
+        field_store(field_store&&) noexcept : field_store() { } // should've just relied on array decay
         field_store&operator=(const field_store&) {
             return *this;
         }
@@ -723,6 +724,89 @@ namespace gc {
             return internal::Copy(field.Get(), handle_role::field, handle_role::ro_pin);
         }
     }
+
+    // relies on 64 bit pointers and 48-bit canonical space
+    template <class T, class U=uint16_t>
+    class tagged_ptr {
+        static constexpr uint8_t canonical_address_bits = 48;
+        static constexpr uint64_t pointer_mask = 0x0000FFFFFFFFFFFF;
+
+        T *ptr = nullptr;
+    public:
+        constexpr tagged_ptr() noexcept = default;
+
+        constexpr tagged_ptr(std::nullptr_t) noexcept {} // already initialized to that
+
+        constexpr tagged_ptr(T *p) noexcept : ptr(p) {}
+
+        constexpr tagged_ptr(T *p, U data={}) noexcept : ptr(p) {
+            Pack(data);
+        }
+
+    private:
+        constexpr void Pack(const U data) noexcept requires(!std::is_same_v<U, uint16_t>) {
+            Pack(std::bit_cast<uint16_t>(data));
+        }
+
+        constexpr void Pack(const uint16_t data) noexcept {
+            ptr = reinterpret_cast<T *>((static_cast<uint64_t>(data) << canonical_address_bits) |
+                                        (reinterpret_cast<uint64_t>(ptr) & pointer_mask));
+        }
+
+    public:
+        [[nodiscard]] constexpr U GetData() const noexcept {
+            return std::bit_cast<U>(static_cast<uint16_t>(reinterpret_cast<uint64_t>(ptr) >> canonical_address_bits));
+        }
+
+        [[nodiscard]] constexpr T *Get() const noexcept {
+            auto masked = reinterpret_cast<uint64_t>(ptr) & pointer_mask;
+#if __x86_64__ || _M_X64
+            // set all top bits to ones if 47th bit is enabled
+            // (sign-extending)
+            constexpr uint64_t sign_bit = 1ULL << 47ULL;
+            constexpr uint64_t sign_extension_bits = 0xFFFF000000000000ULL;
+            if (masked & sign_bit) {
+                masked |= sign_extension_bits;
+            }
+
+            return reinterpret_cast<T *>(masked);
+#endif
+        }
+
+        constexpr void Set(T* ptr) noexcept {
+            uint16_t data = GetData();
+            this->ptr = ptr;
+            Pack(data);
+        }
+
+        constexpr T* operator->() const noexcept {
+            return Get();
+        }
+
+        constexpr std::add_lvalue_reference_t<T> operator*() const noexcept {
+            return *Get();
+        }
+
+        constexpr bool operator==(const tagged_ptr &other) const noexcept {
+            return Get() == other.Get();
+        }
+
+        constexpr bool operator!=(const tagged_ptr &other) const noexcept {
+            return Get() != other.Get();
+        }
+
+        constexpr bool operator==(std::nullptr_t) const noexcept {
+            return Get() == nullptr;
+        }
+
+        constexpr bool operator!=(std::nullptr_t) const noexcept {
+            return Get() != nullptr;
+        }
+
+        constexpr operator bool() const noexcept {
+            return static_cast<bool>(Get());
+        }
+    };
 
     // unlike regular field, root and pin handles, the handles here are able to handle polymorphism
     namespace dyn {
