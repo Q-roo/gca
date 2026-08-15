@@ -813,7 +813,6 @@ namespace gc {
         if (initCount++ == 0) {
             if (args) {
                 impl = new (data) gc_impl(*args);
-                std::construct_at(impl, *args);
                 return true;
             }
 
