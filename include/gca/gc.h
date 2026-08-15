@@ -5,6 +5,9 @@
 #include <utility>
 #include <limits>
 #include <array>
+#include <source_location>
+#include <string_view>
+#include <string>
 
 #include "gc-exceptions.h"
 
@@ -13,11 +16,19 @@ namespace gc {
     typedef struct gc_allocator allocator_handle_t;
     enum class handle_role { internal_initialization, root, field, ro_pin, rw_pin };
 
-    allocator_handle_t *GetNullAllocator();
-    allocator_handle_t *GetDefaultAllocator();
+    allocator_handle_t *GetNullAllocator() noexcept;
+    allocator_handle_t *GetDefaultAllocator() noexcept;
+
+    using assertion_failure_handler_fn = void (*)(const std::source_location &location, std::string_view expression, const std::string &message);
+
+    // not thread-safe: reads global state
+    assertion_failure_handler_fn GetAssertionFailureHandler() noexcept;
+    // not thread-safe: writes global state
+    void SetAssertionFailureHandler(assertion_failure_handler_fn handler /* not nullptr */ );
 
     struct gc_init_args {
-        allocator_handle_t *allocator = GetDefaultAllocator();
+        allocator_handle_t *allocator{GetDefaultAllocator()};
+
         gc_init_args() noexcept = default;
         explicit gc_init_args(allocator_handle_t *allocator) : allocator(allocator) {
             if (allocator == nullptr) {

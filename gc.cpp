@@ -5,6 +5,15 @@
 #include <ranges>
 #include <thread>
 
+gc::assertion_failure_handler_fn assertionFailureHandler{[](const std::source_location &location, std::string_view expression, const std::string &message) {
+    throw gc::library_bug(std::format(
+        "Assertion \"{}\" failed at {} ({}:{}) `{}`: {}",
+        expression, location.file_name(), location.line(), location.column(), location.function_name(), message
+    ));
+}};
+
+#define GCA_ASSERT(x, msg) do { if(auto location = std::source_location::current(); !(x)) { assertionFailureHandler(location, #x, (msg)); } } while(0)
+
 namespace gc {
     gc_impl::gc_impl() noexcept : gc_impl(gc_init_args{}) {}
     gc_impl::gc_impl(const gc_init_args &args)
@@ -236,9 +245,7 @@ namespace gc {
             auto it = std::ranges::find(oldValue->referencedBy, this);
 
             if constexpr (config::enable_assertions) {
-                if (it == oldValue->referencedBy.end()) {
-                    throw library_bug("oldValue wasn't aware of being referenced by obj");
-                }
+                GCA_ASSERT(it != oldValue->referencedBy.end(), "oldValue wasn't aware of being referenced by obj");
             }
 
             std::swap(*it, oldValue->referencedBy.back());
@@ -307,13 +314,11 @@ namespace gc {
                     debugListeners.onBeforeCollectionROLockUpgrade(this, handle);
                 }
                 if constexpr (config::enable_assertions) {
-                    if (!handle->objectLock.TryUpgrade()) {
-                        // this could mean 2 things
-                        // 1. forgot to release a lock (assume that non-library code does not mess with internal handles
-                        //    directly and only uses the exposed functions to manipulate them)
-                        // 2. this object is not dead
-                        throw library_bug("unreleased lock(s) to dead object");
-                    }
+                    // this could mean 2 things
+                    // 1. forgot to release a lock (assume that non-library code does not mess with internal handles
+                    //    directly and only uses the exposed functions to manipulate them)
+                    // 2. this object is not dead
+                    GCA_ASSERT(handle->objectLock.TryUpgrade(), "unreleased lock(s) to dead object");
                 }
                 else {
                     handle->objectLock.Upgrade(); // redundant but just to be safe
@@ -345,10 +350,15 @@ namespace gc {
         MarkGarbage(handle); // in case, it wasn't already
 
         if constexpr (config::enable_assertions) {
-            if (page.memory->data() > handle->objectAllocation.data() ||
-                page.memory->data() + page.memory->size() < handle->objectAllocation.data()) {
-                throw library_bug("object not allocated on this page");
-            }
+            GCA_ASSERT(
+                handle->objectAllocation.data() >= page.memory->data() &&
+                handle->objectAllocation.data() < page.memory->data() + page.memory->size(),
+                "object not allocated on this page");
+        }
+
+        if constexpr (config::enable_assertions) {
+            // this should never fail
+            GCA_ASSERT(handle->objectAllocation.data() + handle->objectAllocation.size() <= page.memory->data() + page.memory->size(), "object goes across page");
         }
 
         {
@@ -357,9 +367,7 @@ namespace gc {
             }
             scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
             if constexpr (config::enable_assertions) {
-                if (!allocationToHandleLookup.erase(handle->objectAllocation.data())) {
-                    throw library_bug("unregistered object");
-                }
+                GCA_ASSERT(allocationToHandleLookup.erase(handle->objectAllocation.data()), "unregistered object");
             }
             else {
                 allocationToHandleLookup.erase(handle->objectAllocation.data());
@@ -423,9 +431,7 @@ namespace gc {
                         const auto newEnd = begin + handle->objectAllocation.size();
 
                         if constexpr (config::enable_assertions) {
-                            if (newBegin != begin || newEnd != end) {
-                                throw library_bug("object got relocated while being destroyed");
-                            }
+                            GCA_ASSERT(newBegin == begin && newEnd == end, "object got relocated while being destroyed");
                         }
                     }
 
@@ -525,10 +531,8 @@ namespace gc {
     internal_handle *gc_impl::GetHandleForObjectAllocation(const void *objAllocation) noexcept(false) {
         internal_handle *handle = TryGetHandleForObjectAllocation(objAllocation);
         if constexpr (config::enable_assertions) {
-            if (handle == nullptr) {
-                // should be a library bug as this function should only be called internally for valid objects
-                throw library_bug("unregistered/invalid allocation");
-            }
+            // should be a library bug as this function should only be called internally for valid objects
+            GCA_ASSERT(handle != nullptr, "unregistered/invalid allocation");
         }
 
         return handle;
@@ -545,9 +549,7 @@ namespace gc {
         const auto [it, success] = allocationToHandleLookup.insert(std::make_pair(allocation.data(), nullptr));
 
         if constexpr (config::enable_assertions) {
-            if (!success) {
-                throw library_bug("dead handle remained in lookup");
-            }
+            GCA_ASSERT(success, "dead handle remained in lookup");
         }
 
         internal_handle *handle = nullptr;
@@ -788,9 +790,7 @@ namespace gc {
         std::pmr::memory_resource *resource = std::pmr::null_memory_resource();
         non_owning_memory_resource_allocator(std::pmr::memory_resource *resource) : resource(resource) {
             if constexpr (config::enable_assertions) {
-                if (resource == nullptr) {
-                    throw library_bug("resource is nullptr");
-                }
+                GCA_ASSERT(resource != nullptr, "resource is nullptr");
             }
         }
 
@@ -825,14 +825,26 @@ namespace gc {
         ~non_owning_memory_resource_allocator() override = default;
     };
 
-    allocator_handle_t *GetNullAllocator() {
+    allocator_handle_t *GetNullAllocator() noexcept {
         static non_owning_memory_resource_allocator allocator(std::pmr::null_memory_resource());
         return &allocator;
     }
 
-    allocator_handle_t *GetDefaultAllocator() {
+    allocator_handle_t *GetDefaultAllocator() noexcept {
         static non_owning_memory_resource_allocator allocator(std::pmr::get_default_resource());
         return &allocator;
+    }
+
+    assertion_failure_handler_fn GetAssertionFailureHandler() noexcept {
+        return assertionFailureHandler;
+    }
+
+    void SetAssertionFailureHandler(const assertion_failure_handler_fn handler) {
+        if (handler == nullptr) {
+            throw bad_api_usage("assertionFailureHandler is nullptr");
+        }
+
+        assertionFailureHandler = handler;
     }
 
     size_t initCount = 0; // TODO: maybe debug assertions for being initialized (in debug mode only)
@@ -899,9 +911,7 @@ namespace gc {
                         throw bad_api_usage("this operation is only meant to be used for creating a root handle from a newly allocated handle");
                     }
                     if constexpr (config::enable_assertions) {
-                        if (src->rootHandleCount != 1) {
-                            throw library_bug("header should have been just initialized to have 1 root reference");
-                        }
+                        GCA_ASSERT(src->rootHandleCount == 1, "header should have been just initialized to have 1 root reference");
                     }
                     return src;
                 case handle_role::root:
@@ -948,10 +958,7 @@ namespace gc {
 
         handle_t *SetField(handle_t *obj, handle_t **field, handle_t *newValue, const handle_role newValueRole) {
             if constexpr (config::enable_assertions) {
-                if (obj == nullptr) {
-                    // assuming no one is calling this directly
-                    throw library_bug("obj is nullptr");
-                }
+                GCA_ASSERT(obj != nullptr, "obj is nullptr");
             }
 
             const auto needsUpgrade = newValueRole == handle_role::ro_pin;
