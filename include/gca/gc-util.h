@@ -206,7 +206,7 @@ namespace gc {
         }
 
         void ClearAll() noexcept {
-            base_type::SetAll(0);
+            base_type::SetAll(static_cast<underlying_type>(0));
         }
     private:
         template <std::enable_if_t<config::gc_throw_nonessential_exceptions, bool> = true>
@@ -247,7 +247,7 @@ namespace gc {
         bool TryAcquireWrite() noexcept {
             // no need to load since in order to get the write lock, no other locks can exist
             counter_type v = 0;
-            auto success = m_Lock.compare_exchange_weak(v, write_mask + 1); // set it to 0b10...01 (in case read overflows)
+            auto success = m_Lock.compare_exchange_strong(v, write_mask + 1); // set it to 0b10...01 (in case read overflows)
             if (success) {
                 GetAcquiredWriteAccessesOnThisThread().emplace(this);
             }
@@ -270,7 +270,7 @@ namespace gc {
 
         bool TryAcquireRead() noexcept {
             counter_type v = ClearWriteBit(m_Lock.load());
-            return m_Lock.compare_exchange_weak(v, v + 1);
+            return m_Lock.compare_exchange_strong(v, v + 1);
         }
 
         bool TryAcquireRead(const size_t attempts) noexcept {
@@ -294,7 +294,7 @@ namespace gc {
 
         bool TryUpgrade() noexcept {
             counter_type v = 1;
-            auto success = m_Lock.compare_exchange_weak(v, write_mask + 1) || v == write_mask + 1; // already rw
+            auto success = m_Lock.compare_exchange_strong(v, write_mask + 1) || v == write_mask + 1; // already rw
             if (success && v != write_mask + 1) {
                 // when this throws, you probably have bigger problems than the noexcept specification of this function
                 GetAcquiredWriteAccessesOnThisThread().emplace(this);
@@ -325,7 +325,7 @@ namespace gc {
 
         void DownGrade() noexcept {
             counter_type v = write_mask + 1;
-            if (m_Lock.compare_exchange_weak(v, 1)) {
+            if (m_Lock.compare_exchange_strong(v, 1)) {
                 GetAcquiredWriteAccessesOnThisThread().erase(this);
             }
         }
@@ -338,7 +338,7 @@ namespace gc {
             // 4: 0b00...00: no lock
 
             // if not case 1
-            if (counter_type v = write_mask + 1; !m_Lock.compare_exchange_weak(v, 0)) {
+            if (counter_type v = write_mask + 1; !m_Lock.compare_exchange_strong(v, 0)) {
                 // then just simply decrement
                 // without under-flowing
                 while (!m_Lock.compare_exchange_weak(v, v != 0 ? v - 1 : v));
@@ -411,7 +411,7 @@ namespace gc {
         public:
         bool TryAcquire() noexcept {
             config::mutex_underlying_type v = false;
-            return m_Lock.compare_exchange_weak(v, true);
+            return m_Lock.compare_exchange_strong(v, true);
         }
 
         void Acquire() noexcept {
@@ -597,23 +597,25 @@ namespace gc {
                 return;
             }
 
-            std::destroy_at(&node->data[slot]);
+            std::destroy_at(std::launder(reinterpret_cast<T*>(&node->data[slot])));
             node->SetSlotIsFree(slot, true);
         }
 
-        void Remove(const T *value) {
+        void Remove(T *value) {
             for (auto &node : nodes) {
-                for (uint8_t i = 0; i < node::capacity; ++i) {
-                    if (node->GetSlotIsFree(i)) {
-                        continue;
-                    }
-
-                    if (&node->data[i] == static_cast<const void *>(value)) {
-                        std::destroy_at(&node->data[i]);
-                        node->SetSlotIsFree(i, true);
-                        return;
-                    }
+                if (reinterpret_cast<void*>(value) < &node->data[0] ||
+                    reinterpret_cast<void*>(value) > &node->data[node->capacity - 1]) {
+                    continue;
                 }
+
+                const auto slot = static_cast<uint8_t>((reinterpret_cast<uintptr_t>(value) - reinterpret_cast<uintptr_t>(&node->data[0])) / sizeof(T));
+                if (!node->GetSlotIsFree(slot)) {
+                    return;
+                }
+
+                std::destroy_at(value);
+                node->SetSlotIsFree(slot, true);
+                return;
             }
         }
 

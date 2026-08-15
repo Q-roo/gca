@@ -972,13 +972,14 @@ namespace gc {
         }
 
         size_t GetMemberCount(const handle_t *array) {
+            // assume at least ro access
             if (array == nullptr) {
                 return 0;
             }
 
             const object_type *type = nullptr;
             {
-                scoped_rw_lock lock(impl->typesLock);
+                scoped_rw_lock lockTypes(impl->typesLock);
                 type = &impl->types[array->objectType];
             }
 
@@ -1036,6 +1037,10 @@ namespace gc {
         void TemporaryUnpin(handle_t *handle) {
             handle->objectLock.Release();
             --handle->rootHandleCount;
+        }
+
+        bool IsRWPinnedByThisThread(const handle_t *handle) {
+            return handle->objectLock.DoesThisThreadHaveRWAccess();
         }
 
         handle_t *New(
