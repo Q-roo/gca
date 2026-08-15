@@ -11,8 +11,9 @@ namespace gc::config {
     using gc_impl_ongoing_gc_count_underlying_type = std::uint8_t;
     constexpr bool gc_throw_nonessential_exceptions = true; // AKA exceptions instead of debug assertions
     constexpr bool enable_debug_messages = true;
+    constexpr bool enable_assertions = true;
     constexpr std::size_t page_size = 4096;
     constexpr std::size_t page_alignment = 4096;
     constexpr std::size_t page_acquire_attempts = 10;
-    constexpr std::uint8_t gc_max_collection_thread_count = 8; // max config value is 64
+    constexpr std::uint8_t gc_max_collection_thread_count = 8; // max config value is
 }

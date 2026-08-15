@@ -224,14 +224,21 @@ namespace gc {
 
 
         if (oldValue != nullptr) {
+            if (oldValue->flags.HasFlag(object_flags::garbage)) {
+                // we do not support resurrection
+                throw bad_api_usage("cannot assign a garbage object to a field");
+            }
+
             const auto hasNoRWAccessToOldValue = !oldValue->objectLock.DoesThisThreadHaveRWAccess();
             if (hasNoRWAccessToOldValue) { oldValue->objectLock.AcquireWrite(); }
             defer release([=]{ if (hasNoRWAccessToOldValue) { oldValue->objectLock.Release(); } });
 
             auto it = std::ranges::find(oldValue->referencedBy, this);
 
-            if (it == oldValue->referencedBy.end()) {
-                throw library_bug("oldValue wasn't aware of being referenced by obj");
+            if constexpr (config::enable_assertions) {
+                if (it == oldValue->referencedBy.end()) {
+                    throw library_bug("oldValue wasn't aware of being referenced by obj");
+                }
             }
 
             std::swap(*it, oldValue->referencedBy.back());
@@ -299,13 +306,17 @@ namespace gc {
                 if constexpr (config::enable_debug_messages) {
                     debugListeners.onBeforeCollectionROLockUpgrade(this, handle);
                 }
-                // handle->objectLock.Upgrade(); // redundant but just to be safe
-                if (!handle->objectLock.TryUpgrade()) {
-                    // this could mean 2 things
-                    // 1. forgot to release a lock (assume that non-library code does not mess with internal handles
-                    //    directly and only uses the exposed functions to manipulate them)
-                    // 2. this object is not dead
-                    throw library_bug("unreleased lock(s) to dead object");
+                if constexpr (config::enable_assertions) {
+                    if (!handle->objectLock.TryUpgrade()) {
+                        // this could mean 2 things
+                        // 1. forgot to release a lock (assume that non-library code does not mess with internal handles
+                        //    directly and only uses the exposed functions to manipulate them)
+                        // 2. this object is not dead
+                        throw library_bug("unreleased lock(s) to dead object");
+                    }
+                }
+                else {
+                    handle->objectLock.Upgrade(); // redundant but just to be safe
                 }
                 try {
                     // don't release the lock after this: the handle is no longer valid
@@ -333,18 +344,25 @@ namespace gc {
         // assume rw access for both the handle and the page
         MarkGarbage(handle); // in case, it wasn't already
 
-        if (page.memory->data() > handle->objectAllocation.data()
-            || page.memory->data() + page.memory->size() < handle->objectAllocation.data()) {
-            throw library_bug("object not allocated on this page");
+        if constexpr (config::enable_assertions) {
+            if (page.memory->data() > handle->objectAllocation.data() ||
+                page.memory->data() + page.memory->size() < handle->objectAllocation.data()) {
+                throw library_bug("object not allocated on this page");
             }
+        }
 
         {
             if constexpr (config::enable_debug_messages) {
                 debugListeners.onBeforeDestroyObjectAllocationLookupRWLockAcquire(this, handle);
             }
             scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
-            if (!allocationToHandleLookup.erase(handle->objectAllocation.data())) {
-                throw library_bug("unregistered object");
+            if constexpr (config::enable_assertions) {
+                if (!allocationToHandleLookup.erase(handle->objectAllocation.data())) {
+                    throw library_bug("unregistered object");
+                }
+            }
+            else {
+                allocationToHandleLookup.erase(handle->objectAllocation.data());
             }
         }
 
@@ -404,8 +422,10 @@ namespace gc {
                         const auto newBegin = reinterpret_cast<uintptr_t>(handle->objectAllocation.data());
                         const auto newEnd = begin + handle->objectAllocation.size();
 
-                        if (newBegin != begin || newEnd != end) {
-                            throw library_bug("object got relocated while being destroyed");
+                        if constexpr (config::enable_assertions) {
+                            if (newBegin != begin || newEnd != end) {
+                                throw library_bug("object got relocated while being destroyed");
+                            }
                         }
                     }
 
@@ -504,9 +524,11 @@ namespace gc {
 
     internal_handle *gc_impl::GetHandleForObjectAllocation(const void *objAllocation) noexcept(false) {
         internal_handle *handle = TryGetHandleForObjectAllocation(objAllocation);
-        if (handle == nullptr) {
-            // should be a library bug as this function should only be called internally for valid objects
-            throw library_bug("unregistered/invalid allocation");
+        if constexpr (config::enable_assertions) {
+            if (handle == nullptr) {
+                // should be a library bug as this function should only be called internally for valid objects
+                throw library_bug("unregistered/invalid allocation");
+            }
         }
 
         return handle;
@@ -522,8 +544,10 @@ namespace gc {
 
         const auto [it, success] = allocationToHandleLookup.insert(std::make_pair(allocation.data(), nullptr));
 
-        if (!success) {
-            throw library_bug("dead handle remained in lookup");
+        if constexpr (config::enable_assertions) {
+            if (!success) {
+                throw library_bug("dead handle remained in lookup");
+            }
         }
 
         internal_handle *handle = nullptr;
@@ -685,6 +709,12 @@ namespace gc {
     void gc_impl::InitPage(page &page) noexcept(false) {
         page.memory = pageAllocator.allocate(1);
         pageAllocator.construct(page.memory);
+        if constexpr (config::enable_assertions) {
+            if (page::GetAlignmentCorrection(reinterpret_cast<uintptr_t>(page.memory->data()), config::page_alignment) != 0) {
+                // this is the responsibility of the allocator, which might be user-implemented
+                throw bad_api_usage(std::format("page memory is not aligned to page alignment ({})", config::page_alignment));
+            }
+        }
     }
 
     void gc_impl::DestroyPage(page &page) noexcept(true) {
@@ -757,8 +787,10 @@ namespace gc {
     struct non_owning_memory_resource_allocator final : gc_allocator {
         std::pmr::memory_resource *resource = std::pmr::null_memory_resource();
         non_owning_memory_resource_allocator(std::pmr::memory_resource *resource) : resource(resource) {
-            if (resource == nullptr) {
-                throw library_bug("resource is nullptr");
+            if constexpr (config::enable_assertions) {
+                if (resource == nullptr) {
+                    throw library_bug("resource is nullptr");
+                }
             }
         }
 
@@ -866,8 +898,10 @@ namespace gc {
                     if (dstRole != handle_role::root) {
                         throw bad_api_usage("this operation is only meant to be used for creating a root handle from a newly allocated handle");
                     }
-                    if (src->rootHandleCount != 1) {
-                        throw library_bug("header should have been just initialized to have 1 root reference");
+                    if constexpr (config::enable_assertions) {
+                        if (src->rootHandleCount != 1) {
+                            throw library_bug("header should have been just initialized to have 1 root reference");
+                        }
                     }
                     return src;
                 case handle_role::root:
@@ -913,9 +947,11 @@ namespace gc {
         }
 
         handle_t *SetField(handle_t *obj, handle_t **field, handle_t *newValue, const handle_role newValueRole) {
-            if (obj == nullptr) {
-                // assuming no one is calling this directly
-                throw library_bug("obj is nullptr");
+            if constexpr (config::enable_assertions) {
+                if (obj == nullptr) {
+                    // assuming no one is calling this directly
+                    throw library_bug("obj is nullptr");
+                }
             }
 
             const auto needsUpgrade = newValueRole == handle_role::ro_pin;
