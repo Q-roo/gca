@@ -73,10 +73,13 @@ It is also possible to create a custom trait type and make the allocator use tha
 (`gc::New<gc_supported T, class Traits = partial_gc_object_traits<T>, class... Args>`)
 
 The type needs to define the following values:
-* get_field_count (`get_field_count_fn`)
-* get_field (`get_field_fn`)
-* move (`move_fn`)
-* destructor (`destructor_fn`)
+* get_field_count (`gc::get_field_count_fn`)
+* get_field (`gc::get_field_fn`)
+* move (`gc::move_fn`)
+* destructor (`gc::destructor_fn`)
+
+Apart from `move`, neither of these function pointers can be `nullptr` and must be `noexcept(true)`. If `move` is
+`nullptr`, the object will be considered immovable. `get_field` may return `nullptr` for invalid field indices.
 
 Alternatively, use `gc_object_traits<Traits>`, where you are only required to define `type` (`Traits::type=T`).
 This generates a traits type that can be used by `gc::New`. Any value defined in `Traits` will be used instead of the
