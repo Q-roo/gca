@@ -807,16 +807,17 @@ namespace gc {
     // don't want the constructor to run before Init is called
     // and don't want to use new/delete
     alignas(alignof(gc_impl)) std::byte data[sizeof(gc_impl)];
-    auto impl = reinterpret_cast<gc_impl *>(&data[0]);
+    gc_impl *impl = nullptr;
 
     bool Init(const gc_init_args *args) {
         if (initCount++ == 0) {
             if (args) {
+                impl = new (data) gc_impl(*args);
                 std::construct_at(impl, *args);
                 return true;
             }
 
-            std::construct_at(impl);
+            impl = new (data) gc_impl();
             return true;
         }
 
@@ -846,6 +847,7 @@ namespace gc {
             // NOTE: collections, allocation and defragmentation operations might still be ongoing,
             //       and it's not my job to ensure that there aren't any
             std::destroy_at(impl);
+            impl = nullptr;
         }
     }
     namespace internal {

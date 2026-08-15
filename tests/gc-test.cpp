@@ -2660,6 +2660,185 @@ TEST(GC_collecting_allocator__public_API, handle_cast_virtual_diamond) {
     EXPECT_EQ(hPCat2S.Get(gc::handle_role::ro_pin), cat2S);
 }
 
+TEST(GC_collecting_allocator__public_API, dyn_api_pin_types) {
+    using rw_pin = gc::dyn::pin<int>;
+    using ro_pin = gc::dyn::pin<const int>;
+
+    using rw_array_pin = gc::dyn::pin<int[]>;
+    using ro_array_pin = gc::dyn::pin<const int[]>;
+
+    EXPECT_TYPE(decltype(rw_pin().Get()), int*);
+    EXPECT_TYPE(decltype(rw_pin().operator->()), int*);
+    EXPECT_TYPE(decltype(rw_pin().operator*()), int&);
+
+    EXPECT_TYPE(decltype(ro_pin().Get()), const int*);
+    EXPECT_TYPE(decltype(ro_pin().operator->()), const int*);
+    EXPECT_TYPE(decltype(ro_pin().operator*()), const int&);
+
+    // EXPECT_TYPE(decltype(rw_array_pin().Get()), int*);
+    // EXPECT_TYPE(decltype(rw_array_pin().operator[](0)), int&);
+    // EXPECT_TYPE(decltype(rw_array_pin().Count()), size_t);
+    //
+    // EXPECT_TYPE(decltype(ro_array_pin().Get()), const int*);
+    // EXPECT_TYPE(decltype(ro_array_pin().operator[](0)), const int&);
+    // EXPECT_TYPE(decltype(ro_array_pin().Count()), size_t);
+}
+
+class DClassA {
+    std::vector<int> toMove;
+};
+
+class DClassB {
+    public:
+    DClassB(DClassB&&) = default;
+    gc::dyn::field<DClassA> a;
+    DClassB(const gc::dyn::root_handle<DClassA> &h) : a{h} {}
+    DClassB(gc::dyn::pin<DClassA> &&p) : a{std::forward<gc::dyn::pin<DClassA>>(p)} {}
+    DClassB(const gc::dyn::field<DClassA> &f) : a{f} {}
+};
+
+template <> struct gc::is_gc_supported<DClassA> {
+    static constexpr bool supported = true;
+};
+
+template <> struct gc::is_gc_supported<DClassB> {
+    static constexpr bool supported = true;
+};
+
+template <> struct gc::partial_gc_object_traits<DClassB> {
+    using type = DClassB;
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept { return 1ULL; };
+    static constexpr get_field_fn get_field = [](void*obj, const size_t idx) noexcept -> internal_handle** {
+        return idx == 0
+        ? std::launder(static_cast<DClassB*>(obj))->a.GetField()
+        : nullptr;
+    };
+};
+
+template<class T>
+class DClassC {
+public:
+    gc::dyn::field<T> field;
+
+    DClassC(const gc::dyn::root_handle<T> &h) :field(h) {}
+    DClassC(gc::dyn::pin<T> &&p) :field(std::forward<gc::dyn::pin<T>>(p)) {}
+    DClassC(const gc::dyn::field<T> &f) :field(f) {}
+
+    DClassC(std::nullptr_t) :field(nullptr) {}
+    DClassC(gc::null_handle_t) :field(gc::null_handle) {}
+
+    DClassC(const gc::dyn::root_handle<std::remove_const_t<T>> &h) requires(std::is_const_v<T>) :field(h) {}
+    DClassC(gc::dyn::pin<std::remove_const_t<T>> &&p) requires(std::is_const_v<T>) :field(std::forward<gc::dyn::pin<std::remove_const_t<T>>>(p)) {}
+    DClassC(const gc::dyn::field<std::remove_const_t<T>> &f) requires(std::is_const_v<T>) :field(f) {}
+};
+
+template <class T> struct gc::is_gc_supported<DClassC<T>> {
+    static constexpr bool supported = true;
+};
+
+template <class T> struct gc::partial_gc_object_traits<DClassC<T>> {
+    using type = DClassC<T>;
+    static constexpr get_field_count_fn get_field_count = [](const void*) noexcept -> size_t { return 1ULL; };
+    static constexpr get_field_fn get_field = [](void *obj, const size_t idx) noexcept -> internal_handle** {
+        return idx == 0
+        ? std::launder(static_cast<DClassC<T>*>(obj))->field.GetField()
+        : nullptr;
+    };
+};
+
+TEST(GC_collecting_allocator__public_API, dyn_api_compiles) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
+    gc::defer destroy([]{gc::Destroy();});
+
+    gc::dyn::root_handle<DClassB> h0 = gc::New<DClassB>(static_cast<gc::dyn::root_handle<DClassA>>(gc::New<DClassA>()));
+    gc::dyn::root_handle<DClassB> h1 = gc::New<DClassB>(h0.PinRO()->a);
+    gc::dyn::root_handle<DClassB> h2 = gc::New<DClassB>(h0.PinRW()->a);
+    gc::dyn::root_handle<DClassB> h7{nullptr};
+    gc::dyn::root_handle<DClassB> h8{gc::null_handle};
+    gc::dyn::root_handle<DClassB> h9{DClassC<DClassB>(gc::null_handle).field};
+    gc::dyn::root_handle<DClassB> h10{std::move(gc::dyn::pin<const DClassB>())};
+    gc::dyn::root_handle<DClassB> h11{std::move(gc::dyn::pin<DClassB>())};
+
+    h0 = nullptr;
+    h0 = gc::null_handle;
+    h0 = h1;
+    h0 = std::move(h1);
+    h0 = DClassC<DClassB>(gc::null_handle).field;
+    h0 = std::move(gc::dyn::pin<const DClassB>());
+    h0 = std::move(gc::dyn::pin<DClassB>());
+
+    gc::dyn::root_handle<const DClassB> hc0{gc::dyn::root_handle<DClassB>()};
+    gc::dyn::root_handle<const DClassB> hc1{DClassC<DClassB>(gc::null_handle).field};
+    gc::dyn::root_handle<const DClassB> hc2{std::move(gc::dyn::pin<const DClassB>())};
+    gc::dyn::root_handle<const DClassB> hc3{std::move(gc::dyn::pin<DClassB>())};
+    gc::dyn::root_handle<const DClassB> hc4{gc::dyn::root_handle<const DClassB>()};
+    gc::dyn::root_handle<const DClassB> hc5{DClassC<const DClassB>(gc::null_handle).field};
+    gc::dyn::root_handle<const DClassB> hc6{std::move(gc::dyn::pin<const DClassB>())};
+    gc::dyn::root_handle<const DClassB> hc7{nullptr};
+    gc::dyn::root_handle<const DClassB> hc8{gc::null_handle};
+
+    hc0 = nullptr;
+    hc0 = gc::null_handle;
+    hc0 = h0;
+    hc0 = std::move(h0);
+    hc0 = hc1;
+    hc0 = std::move(hc1);
+    hc0 = DClassC<DClassB>(gc::null_handle).field;
+    hc0 = std::move(gc::dyn::pin<const DClassB>());
+    hc0 = std::move(gc::dyn::pin<DClassB>());
+    hc0 = DClassC<const DClassB>(gc::null_handle).field;
+    hc0 = std::move(gc::dyn::pin<const DClassB>());
+
+    DClassC<DClassB> f0{gc::dyn::root_handle<DClassB>()};
+    DClassC<DClassB> f1{DClassC<DClassB>(gc::null_handle).field};
+    DClassC<const DClassB> f2{std::move(gc::dyn::pin<const DClassB>())};
+    DClassC<DClassB> f3{std::move(gc::dyn::pin<DClassB>())};
+    DClassC<DClassB> f4{nullptr};
+    DClassC<DClassB> f5{gc::null_handle};
+
+    f0.field = nullptr;
+    f0.field = gc::null_handle;
+    f0.field = f1.field;
+    f0.field = std::move(f1.field);
+    f0.field = DClassC<DClassB>(gc::null_handle).field;
+    f0.field = std::move(gc::dyn::pin<const DClassB>());
+    f0.field = std::move(gc::dyn::pin<DClassB>());
+
+    DClassC<const DClassB> fc0{gc::dyn::root_handle<DClassB>()};
+    DClassC<const DClassB> fc1{DClassC<DClassB>(gc::null_handle).field};
+    DClassC<const DClassB> fc2{gc::dyn::pin<const DClassB>()};
+    DClassC<const DClassB> fc3{gc::dyn::pin<DClassB>()};
+    DClassC<const DClassB> fc4{gc::dyn::root_handle<const DClassB>()};
+    DClassC<const DClassB> fc5{DClassC<const DClassB>(gc::null_handle).field};
+    DClassC<const DClassB> fc6{gc::dyn::pin<const DClassB>()};
+    DClassC<const DClassB> fc7{nullptr};
+    DClassC<const DClassB> fc8{gc::null_handle};
+
+    fc0.field = nullptr;
+    fc0.field = gc::null_handle;
+    fc0.field = f0.field;
+    fc0.field = std::move(f0.field);
+    fc0.field = fc1.field;
+    fc0.field = std::move(fc1.field);
+    fc0.field = DClassC<DClassB>(gc::null_handle).field;
+    fc0.field = gc::dyn::pin<const DClassB>();
+    fc0.field = gc::dyn::pin<DClassB>();
+    fc0.field = DClassC<const DClassB>(gc::null_handle).field;
+    fc0.field = gc::dyn::pin<const DClassB>();
+
+    gc::dyn::pin<const DClassB> pro0{gc::root_handle<DClassB>()};
+    gc::dyn::pin<const DClassB> pro1{DClassC<DClassB>(gc::null_handle).field};
+
+    gc::dyn::pin<DClassB> prw0{gc::root_handle<DClassB>()};
+    gc::dyn::pin<DClassB> prw1{DClassC<DClassB>(gc::null_handle).field};
+
+    gc::dyn::pin<const DClassB> proc0{gc::dyn::root_handle<DClassB>()};
+    gc::dyn::pin<const DClassB> proc1{DClassC<DClassB>(gc::null_handle).field};
+    gc::dyn::pin<const DClassB> proc2{gc::dyn::root_handle<const DClassB>()};
+    gc::dyn::pin<const DClassB> proc3{DClassC<const DClassB>(gc::null_handle).field};
+}
+
 int main(int argc, char **argv) {
 #ifdef _MSC_VER
     // there's something ironic about not having this precisely where I need it
