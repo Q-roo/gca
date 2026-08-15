@@ -143,7 +143,7 @@ namespace gc {
      * the field of
      */
     template <ptrdiff_t field_store_offset, size_t index, class T>
-    struct field;
+    struct field; // FIXME: field is not always field role (could be root handle) (NOTE: not that it actually causes any bugs in the current implementation)
 
     /**
      * @brief The only handle that lets you access the object it references
@@ -155,7 +155,7 @@ namespace gc {
      * @note There is a specialization for arrays
      */
     template <class T, bool ro = std::is_const_v<T>>
-    struct pin; // FIXME: possible deadlock with pin -> root_handle -> pin (FIX: require pins to be moved)
+    struct pin;
 
     namespace internal {
         template <class T, bool ro>
@@ -184,9 +184,9 @@ namespace gc {
         constexpr root_handle(std::nullptr_t) noexcept {}
         constexpr root_handle(null_handle_t) noexcept {}
         template <bool ro>
-        root_handle(const pin<T, ro>& pin) : handle(internal::ToRootHandle(pin)) {}
+        root_handle(pin<T, ro>&& pin) : handle(internal::ToRootHandle(pin)) {}
         template <bool ro>
-        root_handle(const pin<std::remove_const_t<T>, ro>& pin) requires(std::is_const_v<T>) : handle(internal::ToRootHandle(pin)) {}
+        root_handle(pin<std::remove_const_t<T>, ro>&& pin) requires(std::is_const_v<T>) : handle(internal::ToRootHandle(pin)) {}
         template <ptrdiff_t field_store_offset, size_t index>
         root_handle(const field<field_store_offset, index, T>& field) : handle(internal::ToRootHandle(field)) {}
         template <ptrdiff_t field_store_offset, size_t index>
@@ -441,12 +441,12 @@ namespace gc {
         }
 
         template <bool ro>
-        field(const pin<T, ro> &pin) {
+        field(pin<T, ro> &&pin) {
             Set(pin);
         }
 
         template <bool ro>
-        field(const pin<std::remove_const_t<T>, ro> &pin) requires(std::is_const_v<T>) {
+        field(pin<std::remove_const_t<T>, ro> &&pin) requires(std::is_const_v<T>) {
             Set(pin);
         }
 
@@ -486,13 +486,13 @@ namespace gc {
         }
 
         template <bool ro>
-        field &operator=(const pin<T, ro> &pin) {
+        field &operator=(pin<T, ro> &&pin) {
             Set(pin);
             return *this;
         }
 
         template <bool ro>
-        field &operator=(const pin<std::remove_const_t<T>, ro> &pin) requires(std::is_const_v<T>) {
+        field &operator=(pin<std::remove_const_t<T>, ro> &&pin) requires(std::is_const_v<T>) {
             Set(pin);
             return *this;
         }
@@ -884,7 +884,9 @@ namespace gc {
         template <class T>
         polymorphic_handle<typename pin<T>::type> GetHandle(const pin<T> &pin) noexcept;
 
-        // FIXME: pin from field is not always field role (could be root handle)
+        template <class T>
+        handle_role GetFieldRole(const field<T> &field) noexcept;
+
         template <class T>
         class pin {
         public:
@@ -906,15 +908,23 @@ namespace gc {
             pin &operator=(const pin &) = delete;
             pin &operator=(pin &&) = delete;
 
-            pin(const gc::root_handle<rw_type> &handle) : value(handle.handle) {}
+            pin(const gc::root_handle<rw_type> &handle) : value(handle.handle) {
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::root, role));
+            }
 
-            pin(const gc::root_handle<ro_type> &handle) requires(ro) : value(handle.handle) {}
+            pin(const gc::root_handle<ro_type> &handle) requires(ro) : value(handle.handle) {
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::root, role));
+            }
 
             template <ptrdiff_t field_store_offset, size_t index>
-            pin(const gc::field<field_store_offset, index, rw_type> &handle) : value(handle.handle) {}
+            pin(const gc::field<field_store_offset, index, rw_type> &handle) : value(handle.handle) {
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::field, role));
+            }
 
             template <ptrdiff_t field_store_offset, size_t index>
-            pin(const gc::field<field_store_offset, index, ro_type> &handle) requires(ro) : value(handle.handle) {}
+            pin(const gc::field<field_store_offset, index, ro_type> &handle) requires(ro) : value(handle.handle) {
+                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::field, role));
+            }
 
             template <class U>
             pin(const root_handle<U> &handle) {
@@ -931,13 +941,13 @@ namespace gc {
             template <class U>
             pin(const field<U> &field) {
                 value = GetHandle(field);
-                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::field, role));
+                value.handle.Set(internal::Copy(value.handle.Get(), GetFieldRole(field), role));
             }
 
             template <class U>
             pin(const field<const U> &field) requires(ro) {
                 value = GetHandle(field);
-                value.handle.Set(internal::Copy(value.handle.Get(), handle_role::field, role));
+                value.handle.Set(internal::Copy(value.handle.Get(), GetFieldRole(field), role));
             }
 
             [[nodiscard]] constexpr bool IsNull() const noexcept {
@@ -968,7 +978,7 @@ namespace gc {
                 return internal::GetMemberCount(value.handle.Get());
             }
 
-            std::add_lvalue_reference_t<type> operator[](size_t index) const {
+            std::add_lvalue_reference_t<type> operator[](size_t index) const requires(std::is_same_v<T, array_type>) {
                 return Get()[index];
             }
 
@@ -1067,7 +1077,7 @@ namespace gc {
 
             template <class U>
             root_handle(const field<U> &field) {
-                Assign(GetHandle(field), handle_role::field);
+                Assign(GetHandle(field), GetFieldRole(field));
             }
 
             root_handle(root_handle &&other) noexcept /* won't throw if there are no bugs */ {
@@ -1143,7 +1153,7 @@ namespace gc {
 
             template <class U>
             root_handle &operator=(const field<U> &field) {
-                Assign(GetHandle(field), handle_role::field);
+                Assign(GetHandle(field), GetFieldRole(field));
                 return *this;
             }
 
@@ -1220,6 +1230,7 @@ namespace gc {
         template <class T>
         class field {
             friend polymorphic_handle<T> GetHandle<>(const field&) noexcept;
+            friend handle_role GetFieldRole<>(const field&) noexcept;
 
             template <class U>
             friend class field;
@@ -1470,14 +1481,14 @@ namespace gc {
             return field.GetDynamicHandle();
         }
 
-        // template <class T, bool ro>
-        // polymorphic_handle<typename pin<T, ro>::return_element_type> GetHandle(const pin<T, ro> &pin) noexcept {
-        //     return pin.value;
-        // }
-
         template <class T>
         polymorphic_handle<typename pin<T>::type> GetHandle(const pin<T> &pin) noexcept {
             return pin.value;
+        }
+
+        template <class T>
+        handle_role GetFieldRole(const field<T> &field) noexcept {
+            return field.GetHandleRole();
         }
     }
 

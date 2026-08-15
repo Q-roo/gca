@@ -1989,7 +1989,7 @@ class ClassB {
     [[no_unique_address]]gc::field<0,0, ClassA> a;
     ClassB(const gc::root_handle<ClassA> &h) : a{h} {}
     template <bool ro>
-    ClassB(const gc::pin<ClassA, ro> &p) : a{p} {}
+    ClassB(gc::pin<ClassA, ro> &&p) : a{std::move(p)} {}
     template <ptrdiff_t field_store_offset, size_t index>
     ClassB(const gc::field<field_store_offset, index, ClassA> &f) : a{f} {}
 };
@@ -2021,7 +2021,7 @@ public:
 
     ClassC(const gc::root_handle<T> &h) :field(h) {}
     template <bool ro>
-    ClassC(const gc::pin<T, ro> &p) :field(p) {}
+    ClassC(gc::pin<T, ro> &&p) :field(std::move(p)) {}
     template <auto offset, auto index>
     ClassC(const gc::field<offset, index, T> &f) :field(f) {}
 
@@ -2030,7 +2030,7 @@ public:
 
     ClassC(const gc::root_handle<std::remove_const_t<T>> &h) requires(std::is_const_v<T>) :field(h) {}
     template <bool ro>
-    ClassC(const gc::pin<std::remove_const_t<T>, ro> &p) requires(std::is_const_v<T>) :field(p) {}
+    ClassC(gc::pin<std::remove_const_t<T>, ro> &&p) requires(std::is_const_v<T>) :field(std::move(p)) {}
     template <auto offset, auto index>
     ClassC(const gc::field<offset, index, std::remove_const_t<T>> &f) requires(std::is_const_v<T>) :field(f) {}
 };
