@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 4.1)
 project(
     gca
-    DESCRIPTION "A toy allocator with garbage collection that lacks speed, but supports is thread safe at the very least"
+    DESCRIPTION "A toy allocator with garbage collection that lacks speed, but supports thread safety at the very least"
     LANGUAGES CXX
     VERSION 0.0.0
 )
