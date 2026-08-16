@@ -31,16 +31,15 @@ namespace gc {
         }
 
         if (type.size * count > config::page_size) {
-            const auto allocation = allocator->AllocateLargeObject(type, count);
-            if (allocation.empty()) {
-                throw std::bad_alloc();
-            }
-
-
             scoped_rw_lock lockLargeObjects(largeObjectsLock, scoped_rw_lock::mode::rw);
             internal_handle **handle = nullptr;
 
             CollectLargeObjectsFast();
+
+            const auto allocation = allocator->AllocateLargeObject(type, count);
+            if (allocation.empty()) {
+                throw std::bad_alloc();
+            }
 
             try {
                 handle = &largeObjects.emplace_back(nullptr);

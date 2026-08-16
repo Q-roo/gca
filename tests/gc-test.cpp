@@ -98,11 +98,14 @@ std::string demangled_type_name() {
 }
 
 class simulated_out_of_storage_resource : public std::pmr::memory_resource {
-    size_t maxAllocationCount = 0, currentAllocationCount = 0;
+    size_t maxAllocationCount = 0, currentAllocationCount = 0, deallocationCount = 0;
     std::pmr::unsynchronized_pool_resource resource{};
 public:
     simulated_out_of_storage_resource(size_t maxAllocationCount) : maxAllocationCount(maxAllocationCount) {}
     simulated_out_of_storage_resource() = default;
+
+    [[nodiscard]] constexpr size_t AllocationCount() const noexcept { return std::min(currentAllocationCount, maxAllocationCount); }
+    [[nodiscard]] constexpr size_t DeallocationCount() const noexcept { return deallocationCount; }
 
     ~simulated_out_of_storage_resource() override = default;
 
@@ -115,6 +118,7 @@ private:
     }
 
     void do_deallocate(void *__p, std::size_t __bytes, std::size_t __alignment) override {
+        ++deallocationCount;
         return resource.deallocate(__p, __bytes, __alignment);
     }
 
@@ -2569,6 +2573,63 @@ TEST(GC_collecting_allocator__public_API, can_handle_large_objects) {
         auto hLarge = gc::NewArray<std::byte>(gc::config::page_size + 1);
     }
     EXPECT_EQ(destroyedCount, 1);
+}
+
+TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_large_object_allocation_failure) {
+    TerminateOnDeadlockGuard guard{};
+    // can allocate, but not track
+    {
+        allocation_failure_test_allocator allocator{
+            1,
+            1,
+            1,
+            0,
+            1,
+            1,
+            0,
+            1,
+            0,
+        };
+        ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+        gc::defer destroy(&gc::Destroy);
+        ASSERT_THROW(gc::NewArray<std::byte>(gc::config::page_size + 1), std::bad_alloc);
+        const auto &lom = allocator.largeObjectMemory;
+        EXPECT_TRUE(lom.AllocationCount() == 0 || lom.AllocationCount() == lom.DeallocationCount()) << lom.AllocationCount() << " allocations and " << lom.DeallocationCount() << " deallocations";
+        EXPECT_TRUE(gc::impl->largeObjectsLock.TryAcquireWrite());
+        gc::impl->largeObjectsLock.Release();
+        EXPECT_TRUE(gc::impl->typesLock.TryAcquireWrite());
+        gc::impl->typesLock.Release();
+        EXPECT_TRUE(gc::impl->allocationLookupLock.TryAcquireWrite());
+        gc::impl->allocationLookupLock.Release();
+        EXPECT_TRUE(gc::impl->largeObjects.empty());
+    }
+
+    // can track, but not allocate
+    {
+        allocation_failure_test_allocator allocator{
+            1,
+            1,
+            1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+        };
+        ASSERT_TRUE(gc::Init(gc::gc_init_args{&allocator}));
+        gc::defer destroy(&gc::Destroy);
+        ASSERT_THROW(gc::NewArray<std::byte>(gc::config::page_size + 1), std::bad_alloc);
+        const auto &lom = allocator.largeObjectMemory;
+        EXPECT_TRUE(lom.AllocationCount() == 0 || lom.AllocationCount() == lom.DeallocationCount()) << lom.AllocationCount() << " allocations and " << lom.DeallocationCount() << " deallocations";
+        EXPECT_TRUE(gc::impl->largeObjects.empty());
+        EXPECT_TRUE(gc::impl->largeObjectsLock.TryAcquireWrite());
+        gc::impl->largeObjectsLock.Release();
+        EXPECT_TRUE(gc::impl->typesLock.TryAcquireWrite());
+        gc::impl->typesLock.Release();
+        EXPECT_TRUE(gc::impl->allocationLookupLock.TryAcquireWrite());
+        gc::impl->allocationLookupLock.Release();
+    }
 }
 
 class PolymorphicBase { uint64_t _{}; public: virtual ~PolymorphicBase() = default; };
