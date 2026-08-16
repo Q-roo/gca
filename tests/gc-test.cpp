@@ -2555,6 +2555,22 @@ TEST(GC_collecting_allocator__public_API, strong_exception_guarantee_on_referenc
     hClassB->objectLock.Release();
 }
 
+template <> struct gc::is_gc_supported<std::byte> {
+    constexpr static bool supported = true;
+};
+
+TEST(GC_collecting_allocator__public_API, can_handle_large_objects) {
+    TerminateOnDeadlockGuard guard{};
+    ASSERT_TRUE(gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
+    auto destroyedCount = 0;
+    {
+        gc::defer destroy(&gc::Destroy);
+        gc::impl->debugListeners.onAfterObjectDestroyed = [&](auto...) { ++destroyedCount; };
+        auto hLarge = gc::NewArray<std::byte>(gc::config::page_size + 1);
+    }
+    EXPECT_EQ(destroyedCount, 1);
+}
+
 class PolymorphicBase { uint64_t _{}; public: virtual ~PolymorphicBase() = default; };
 class PolymorphicDerived : public PolymorphicBase { uint64_t _{}; public: ~PolymorphicDerived() override = default; };
 

@@ -48,11 +48,16 @@ Initialize the grabage collector.
 
 #### `gc::Destroy`
 
-Destroy the garbage collector. Note that the collector must be in an idle state when this is called.
+Destroy the garbage collector. Note that the collector must be in an idle state when this is called. Calling this will
+result in all objects being destroyed regardless of whether they are garbage or not.
 
 #### `gc::New`
 
-Allocate and initialize an instance of type `T`. Specializations for arrays exist as well.
+Allocate and initialize an instance of type `T`.
+
+#### `gc::NewArray`
+
+Allocate and initialize a continuous region of `T` instances.
 
 #### Making the GC support a type
 
@@ -111,7 +116,7 @@ void example() {
 
 #### Example usage (with fields)
 
-The implementation for field for the non-polymorphic API is very scuffed and its usage is not recommend.
+The implementation for fields in the non-polymorphic API is very scuffed and its usage is not recommended.
 
 ```c++
 #include <gca/gc.h>

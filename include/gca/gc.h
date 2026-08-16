@@ -348,12 +348,12 @@ namespace gc {
         constexpr pin() noexcept = default;
         constexpr pin(std::nullptr_t) noexcept {}
         constexpr pin(null_handle_t) noexcept {}
-        pin(const root_handle<rw_element_type[]> &handle) : handle(ro ? PinRO(handle) : PinRW(handle)) {}
+        pin(const root_handle<rw_element_type[]> &handle) : handle(ro ? internal::PinRO(handle) : internal::PinRW(handle)) {}
         template <ptrdiff_t field_store_offset, size_t index>
-        pin(const field<field_store_offset, index, rw_element_type[]> &field) : handle(ro ? PinRO(field) : PinRW(field)) {}
-        pin(const root_handle<ro_element_type[]> &handle) : handle(PinRO(handle)) {}
+        pin(const field<field_store_offset, index, rw_element_type[]> &field) : handle(ro ? internal::PinRO(field) : internal::PinRW(field)) {}
+        pin(const root_handle<ro_element_type[]> &handle) : handle(internal::PinRO(handle)) {}
         template <ptrdiff_t field_store_offset, size_t index>
-        pin(const field<field_store_offset, index, ro_element_type[]> &field) : handle(PinRO(field)) {}
+        pin(const field<field_store_offset, index, ro_element_type[]> &field) : handle(internal::PinRO(field)) {}
 
         pin(const pin&) = delete;
         pin& operator=(const pin&) = delete;
@@ -1742,10 +1742,10 @@ namespace gc {
      * @note The allocated instances are uninitialized. Call initialize to construct them
      */
     template <gc_supported T, class Traits = partial_gc_object_traits<T>>
-    root_handle<T[]> Allocate(const size_t count) {
+    root_handle<T[]> AllocateArray(const size_t count) {
         using object_traits = gc_object_traits<Traits>;
 
-        return root_handle<T>(internal::New(
+        return root_handle<T[]>(internal::New(
             sizeof(T),
             alignof(T),
             count,
@@ -1795,17 +1795,15 @@ namespace gc {
      * @throws ... Anything that the @p initMember could throw
      */
     template <class T, class InitMemberFn>
-    bool Initialize(pin<T[], false> instance, InitMemberFn&& initMember) {
+    bool InitializeArray(pin<T[], false> instance, InitMemberFn&& initMember) {
         if (!internal::TryAcquireInitializeRight(instance.handle)) {
             return false;
         }
 
         try {
-            T array[] = instance.Get();
             const size_t count = instance.Count();
-
             for (size_t i = 0; i < count; ++i) {
-                initMember(&array[i], i);
+                initMember(&instance[i], i);
             }
 
             return true;
@@ -1826,7 +1824,7 @@ namespace gc {
      * @throws ... Anything that the copy constructor of @tp T could throw
      */
     template <class T>
-    bool Initialize(pin<T[], false> instance, const T& defaultValue) {
+    bool InitializeArray(pin<T[], false> instance, const T& defaultValue) {
         if (!internal::TryAcquireInitializeRight(instance.handle)) {
             return false;
         }
@@ -1874,9 +1872,9 @@ namespace gc {
      * @throws ... Anything that the allocator, the containers and @p initMember could throw
      */
     template <gc_supported T, class Traits = partial_gc_object_traits<T>, class InitMemberFn>
-    root_handle<T[]> New(const size_t count, InitMemberFn &&initMember) {
-        auto handle = Allocate<T, Traits>(count);
-        Initialize(RWPin(handle), std::forward<InitMemberFn>(initMember));
+    root_handle<T[]> NewArray(const size_t count, InitMemberFn &&initMember) {
+        auto handle = AllocateArray<T, Traits>(count);
+        InitializeArray(RWPin(handle), std::forward<InitMemberFn>(initMember));
         return handle;
     }
 
@@ -1890,9 +1888,9 @@ namespace gc {
      * @throws ... Anything that the allocator, the containers and the copy constructor of @tp T could throw
      */
     template <gc_supported T, class Traits = partial_gc_object_traits<T>>
-    root_handle<T[]> New(const size_t count, const T& defaultValue) {
-        auto handle = Allocate<T, Traits>(count);
-        Initialize(RWPin(handle), defaultValue);
+    root_handle<T[]> NewArray(const size_t count, const T& defaultValue) {
+        auto handle = AllocateArray<T, Traits>(count);
+        InitializeArray(RWPin(handle), defaultValue);
         return handle;
     }
 
@@ -1905,8 +1903,8 @@ namespace gc {
      * @throws ... Anything that the allocator, the containers and the default constructor of @tp T could throw
      */
     template <gc_supported T, class Traits = partial_gc_object_traits<T>>
-    root_handle<T[]> New(const size_t count) {
-        return New<T, Traits>(count, [](T* member, size_t) {
+    root_handle<T[]> NewArray(const size_t count) {
+        return NewArray<T, Traits>(count, [](T* member, size_t) {
             std::construct_at(member);
         });
     }
