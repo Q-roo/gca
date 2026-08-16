@@ -116,14 +116,15 @@ namespace gc {
         uninitialized         = 1 << 0,
         garbage               = 1 << 1,
         immovable             = 1 << 2,
-        initialization_failed = 1 << 3,
+        large                 = 1 << 3,
+        initialization_failed = 1 << 4,
     };
 
     template<>
     struct enum_flag_traits<object_flags> {
         using underlying_type = uint8_t;
         constexpr static bool is_flag = true;
-        constexpr static uint8_t all_flags = 0b1111;
+        constexpr static uint8_t all_flags = 0b11111;
     };
 
     struct internal_handle {
@@ -290,6 +291,31 @@ namespace gc {
          */
         virtual std::pmr::vector<internal_handle*> CreateReferencedByVectorForHandle()  noexcept = 0;
 
+        /**
+         * @brief Allocate an object larger than gc::config::page_size
+         * @param type The type of the objects
+         * @param count The count of instances of @p type that need continuous space
+         * @return An allocation large enough for the @p count instances
+         * @note The implementation may call this from multiple threads at once
+         * @note This is just allocation, not allocation and initialization
+         */
+        virtual page_allocation AllocateLargeObject(const object_type &type, size_t count) = 0;
+
+        /**
+         * @brief Deallocate the space for a large object that was allocated by this allocator
+         * @param allocation The allocation to deallocate
+         * @param type The type of the object being deallocated
+         * @note The GC implementation may call this function from multiple threads at once
+         * @note The destructor for the object(s) at @p allocation has already been called
+         */
+        virtual void DeallocateLargeObject(page_allocation allocation, const object_type &type) noexcept = 0;
+
+        /**
+         * @brief Create the vector that will hold all currently allocated large object handles
+         * @return The vector that will hold all large object handles
+         */
+        virtual std::pmr::vector<internal_handle*> CreateLargeObjectsVector()  noexcept = 0;
+
         virtual ~gc_allocator() = default;
     };
 
@@ -297,6 +323,8 @@ namespace gc {
         gc_allocator *allocator = nullptr;
         std::pmr::vector<object_type> types{};
         rw_lock typesLock{};
+        std::pmr::vector<internal_handle*> largeObjects{};
+        rw_lock largeObjectsLock{};
         std::pmr::list<page> pages{};
         mutex pageAllocationLock{};
         rw_lock pagesLock{};
@@ -386,6 +414,22 @@ namespace gc {
         void CollectOnPage(page &page) noexcept(false);
 
         /**
+         * @brief Collect (not all) large objects quickly
+         */
+        void CollectLargeObjectsFast() noexcept(false);
+
+        /**
+         * @brief Collect all large objects
+         */
+        void CollectLargeObjectsSlow() noexcept(false);
+
+        /**
+         * @brief Destroy a large object
+         * @param handle The object to destroy
+         */
+        void DestroyLargeObject(internal_handle *handle) noexcept(false);
+
+        /**
          * @brief Destroy an object
          *
          * Deallocates the space and calls the destructor for the object(s)
@@ -399,6 +443,19 @@ namespace gc {
          * (field only refers to field handles)
          */
         void DestroyObject(page &page, internal_handle *handle) noexcept(false);
+        /**
+        * @brief Destroy an object
+        *
+        * Sets the fields to null_handle and calls the destructor for the object(s)
+        *
+        * @param handle The handle to the object
+        * @note If the allocation is an array allocation, then each object of the array will be destroyed individually
+        * @note The object (or objects in the cases of arrays) will only be destroyed if they have been initialized.
+        * @note Object(s) that have attempted and failed to initialize will still be destroyed.
+        * @note Every field (that the collector is aware of) will be set to null before the destructor is called.
+        * (field only refers to field handles)
+        */
+        void CallDestructorForObject(internal_handle *handle) noexcept(false);
         bool TryFindRootFor(internal_handle *handle, thread_count id) noexcept(true);
         internal_handle *TryGetHandleForObjectAllocation(const void *objAllocation) noexcept(true); // can return nullptr
         internal_handle *GetHandleForObjectAllocation(const void *objAllocation) noexcept(false); // throws instead of returning nullptr

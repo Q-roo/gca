@@ -19,6 +19,7 @@ namespace gc {
     gc_impl::gc_impl(const gc_init_args &args)
     : allocator(args.allocator)
     , types(allocator->CreateTypesVector())
+    , largeObjects(allocator->CreateLargeObjectsVector())
     , pages(allocator->CreatePagesList())
     , pageAllocator(allocator->CreatePageMemoryAllocator())
     , objectHandles(allocator->CreateObjectHandlesContainer())
@@ -29,11 +30,36 @@ namespace gc {
             debugListeners.onAllocation(this, type, count);
         }
 
-        // FIXME: handle large objects
         if (type.size * count > config::page_size) {
-            throw bad_api_usage("large objects are not supported yet");
+            const auto allocation = allocator->AllocateLargeObject(type, count);
+            if (allocation.empty()) {
+                throw std::bad_alloc();
+            }
+
+
+            scoped_rw_lock lockLargeObjects(largeObjectsLock, scoped_rw_lock::mode::rw);
+            internal_handle **handle = nullptr;
+
+            CollectLargeObjectsFast();
+
+            try {
+                handle = &largeObjects.emplace_back(nullptr);
+                return *handle = RegisterObject(allocation, GetOrRegisterType(type));
+            }
+            catch (...) {
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onObjectRegisterFailed(this, allocation);
+                }
+                if (handle != nullptr) {
+                    largeObjects.pop_back();
+                }
+                allocator->DeallocateLargeObject(allocation, type);
+                throw;
+            }
         }
 
+        // reversing the iteration order would result in faster allocation,
+        // but then, the older pages would get rarely visited
         std::pmr::list<page>::iterator begin{}, end{};
 
         {
@@ -87,15 +113,117 @@ namespace gc {
             try {
                 return RegisterObject(allocation, GetOrRegisterType(type));
             } catch (...) {
-                page.RemoveAllocation(allocation);
                 if constexpr (config::enable_debug_messages) {
                     debugListeners.onObjectRegisterFailed(this, allocation);
                 }
+                page.RemoveAllocation(allocation);
                 throw;
             }
         }
 
+        {
+            scoped_rw_lock lockLargeObjects(largeObjectsLock, scoped_rw_lock::mode::rw);
+            CollectLargeObjectsSlow();
+        }
+
         return TryAllocateOnNewPage(type, count);
+    }
+
+    void gc_impl::CollectLargeObjectsFast() {
+        // assume rw access to largeObjects
+        for (size_t i = 0; i < largeObjects.size(); ++i) {
+            // exploit the fact that the garbage flag will be set for non-cyclic objects the moment they become unreachable
+            // (and most large objects are not cyclic)
+            if (IsMarkedGarbage(largeObjects[i])) {
+                std::swap(largeObjects[i], largeObjects.back());
+
+                // no need to release the lock as it's about to be destroyed
+                if constexpr (config::enable_assertions) {
+                    GCA_ASSERT(largeObjects.back()->objectLock.TryAcquireWrite(), "unreleased lock(s) to dead object");
+                }
+                else {
+                    largeObjects.back()->objectLock.AcquireWrite(); // redundant, but just to be safe
+                }
+
+                DestroyLargeObject(largeObjects.back());
+                largeObjects.pop_back();
+                --i;
+            }
+        }
+    }
+
+    void gc_impl::CollectLargeObjectsSlow() noexcept(false) {
+        // assume rw access to largeObjects
+
+        thread_count id;
+        while ((id = gcCount++) >= config::gc_max_collection_thread_count) {
+            --gcCount;
+        }
+
+        if constexpr (config::enable_debug_messages) {
+            //TODO: debugListeners.onLargeCollectionStart(this);
+        }
+
+         for (size_t i = 0; i < largeObjects.size(); ++i)
+        {
+            auto handle = largeObjects[i];
+
+            if (handle->rootHandleCount > 0) {
+                continue;
+            }
+
+            // alive if acquisition fails
+            // temporary write access that should fail often for alive objects
+             if (handle->objectLock.TryAcquireWrite()) {
+                 handle->objectLock.Release();
+             }
+             else {
+                 continue; // alive
+             }
+
+            if constexpr (config::enable_debug_messages) {
+                debugListeners.onBeforeCollectionROLockAcquire(this, handle);
+            }
+            if (!handle->objectLock.TryAcquireRead(1)) {
+                continue; // alive
+            }
+
+            if (IsMarkedGarbage(handle) || !TryFindRootFor(handle, id)) {
+                if constexpr (config::enable_debug_messages) {
+                    debugListeners.onBeforeCollectionROLockUpgrade(this, handle);
+                }
+                if constexpr (config::enable_assertions) {
+                    // this could mean 2 things
+                    // 1. forgot to release a lock (assume that non-library code does not mess with internal handles
+                    //    directly and only uses the exposed functions to manipulate them)
+                    // 2. this object is not dead
+                    GCA_ASSERT(handle->objectLock.TryUpgrade(), "unreleased lock(s) to dead object");
+                }
+                else {
+                    handle->objectLock.Upgrade(); // redundant but just to be safe
+                }
+                try {
+                    // don't release the lock after this: the handle is no longer valid
+                    DestroyLargeObject(handle);
+                } catch (...) {
+                    if constexpr (config::enable_debug_messages) {
+                        debugListeners.onObjectDestroyFailed(this, handle);
+                    }
+                    handle->objectLock.Release();
+                    throw;
+                }
+                std::swap(largeObjects[i], largeObjects.back());
+                largeObjects.pop_back();
+                --i;
+            }
+            else {
+                handle->objectLock.Release();
+            }
+        }
+
+        if constexpr (config::enable_debug_messages) {
+            //TODO: debugListeners.onLargeCollectionFinished(this);
+        }
     }
 
     void gc_impl::DefragmentOnPage(page &page) noexcept(false) {
@@ -225,6 +353,11 @@ namespace gc {
                 throw bad_api_usage("cannot set the fields of garbage objects to non-null values");
             }
 
+            if (newValue->flags.HasFlag(object_flags::garbage)) {
+                // we do not support resurrection
+                throw bad_api_usage("cannot assign a garbage object to a field");
+            }
+
             const auto hasNoRWAccessToNewValue = !newValue->objectLock.DoesThisThreadHaveRWAccess();
             if (hasNoRWAccessToNewValue) { newValue->objectLock.AcquireWrite(); }
             defer release([=]{ if (hasNoRWAccessToNewValue) { newValue->objectLock.Release(); } });
@@ -233,11 +366,6 @@ namespace gc {
 
 
         if (oldValue != nullptr) {
-            if (oldValue->flags.HasFlag(object_flags::garbage)) {
-                // we do not support resurrection
-                throw bad_api_usage("cannot assign a garbage object to a field");
-            }
-
             const auto hasNoRWAccessToOldValue = !oldValue->objectLock.DoesThisThreadHaveRWAccess();
             if (hasNoRWAccessToOldValue) { oldValue->objectLock.AcquireWrite(); }
             defer release([=]{ if (hasNoRWAccessToOldValue) { oldValue->objectLock.Release(); } });
@@ -250,6 +378,10 @@ namespace gc {
 
             std::swap(*it, oldValue->referencedBy.back());
             oldValue->referencedBy.pop_back();
+
+            if (oldValue->referencedBy.empty() && oldValue->rootHandleCount == 0) {
+                oldValue->flags.SetFlag(object_flags::garbage, true);
+            }
 
             oldValue->objectLock.Release();
         }
@@ -302,11 +434,19 @@ namespace gc {
             }
 
             // alive if acquisition fails
+            // temporary write access that should fail often for alive objects
+            if (handle->objectLock.TryAcquireWrite()) {
+                handle->objectLock.Release();
+            }
+            else {
+                continue; // alive
+            }
+
             if constexpr (config::enable_debug_messages) {
                 debugListeners.onBeforeCollectionROLockAcquire(this, handle);
             }
             if (!handle->objectLock.TryAcquireRead(1)) {
-                continue; // 1 attempt should be able to determine that
+                continue; // alive
             }
 
             if (IsMarkedGarbage(handle) || !TryFindRootFor(handle, id)) {
@@ -345,23 +485,32 @@ namespace gc {
         }
     }
 
-    void gc_impl::DestroyObject(page &page, internal_handle *handle) noexcept(false) {
-        // assume rw access for both the handle and the page
-        MarkGarbage(handle); // in case, it wasn't already
+    void gc_impl::DestroyLargeObject(internal_handle *handle) noexcept(false) {
+        // assume rw access to handle
+        MarkGarbage(handle);
 
-        if constexpr (config::enable_assertions) {
-            GCA_ASSERT(
-                handle->objectAllocation.data() >= page.memory->data() &&
-                handle->objectAllocation.data() < page.memory->data() + page.memory->size(),
-                "object not allocated on this page");
-        }
-
-        if constexpr (config::enable_assertions) {
-            // this should never fail
-            GCA_ASSERT(handle->objectAllocation.data() + handle->objectAllocation.size() <= page.memory->data() + page.memory->size(), "object goes across page");
-        }
-
+        CallDestructorForObject(handle);
+        const object_type *type = nullptr;
         {
+            scoped_rw_lock lockTypes(typesLock);
+            type = &types[handle->objectType];
+        }
+        allocator->DeallocateLargeObject(handle->objectAllocation, *type);
+
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeDestroyObjectAllocationLookupRWLockAcquire(this, handle);
+        }
+        scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
+
+        objectHandles.Remove(handle);
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onAfterObjectDestroyed(this, handle);
+        }
+    }
+
+    void gc_impl::CallDestructorForObject(internal_handle *handle) noexcept(false) {
+        {
+            // assume rw access to handle
             if constexpr (config::enable_debug_messages) {
                 debugListeners.onBeforeDestroyObjectAllocationLookupRWLockAcquire(this, handle);
             }
@@ -447,8 +596,32 @@ namespace gc {
                 type->destructor(obj);
             }
         }
+    }
+
+    void gc_impl::DestroyObject(page &page, internal_handle *handle) noexcept(false) {
+        // assume rw access for both the handle and the page
+        MarkGarbage(handle); // in case, it wasn't already
+
+        if constexpr (config::enable_assertions) {
+            GCA_ASSERT(
+                handle->objectAllocation.data() >= page.memory->data() &&
+                handle->objectAllocation.data() < page.memory->data() + page.memory->size(),
+                "object not allocated on this page");
+        }
+
+        if constexpr (config::enable_assertions) {
+            // this should never fail
+            GCA_ASSERT(handle->objectAllocation.data() + handle->objectAllocation.size() <= page.memory->data() + page.memory->size(), "object goes across page");
+        }
+
+        CallDestructorForObject(handle);
 
         page.RemoveAllocation(handle->objectAllocation);
+
+        if constexpr (config::enable_debug_messages) {
+            debugListeners.onBeforeDestroyObjectAllocationLookupRWLockAcquire(this, handle);
+        }
+        scoped_rw_lock lock(allocationLookupLock, scoped_rw_lock::mode::rw);
 
         objectHandles.Remove(handle);
         if constexpr (config::enable_debug_messages) {
@@ -562,8 +735,13 @@ namespace gc {
                     debugListeners.onBeforeRegisterObjectTypesROLockAcquire(this, allocation, type);
                 }
                 scoped_rw_lock lockTypes(typesLock);
+
                 if (types[type].move == nullptr) {
                     handle->flags.SetFlag(object_flags::immovable, true);
+                }
+
+                if (allocation.size() > config::page_size) {
+                    handle->flags.SetFlag(object_flags::large, true);
                 }
             }
 
@@ -634,10 +812,10 @@ namespace gc {
             try {
                 return RegisterObject(allocation, GetOrRegisterType(type));
             } catch (...) {
-                page.RemoveAllocation(allocation);
                 if constexpr (config::enable_debug_messages) {
                     debugListeners.onObjectRegisterFailed(this, allocation);
                 }
+                page.RemoveAllocation(allocation);
                 throw;
             }
         }
@@ -784,6 +962,11 @@ namespace gc {
 
             DestroyPage(page);
         }
+
+        scoped_rw_lock lockLargeObjects(largeObjectsLock);
+        for (internal_handle *handle : largeObjects) {
+            DestroyLargeObject(handle);
+        }
     }
 
     struct non_owning_memory_resource_allocator final : gc_allocator {
@@ -819,6 +1002,19 @@ namespace gc {
         }
 
         std::pmr::vector<internal_handle *> CreateReferencedByVectorForHandle() noexcept override {
+            return std::pmr::vector<internal_handle*>(resource);
+        }
+
+        page_allocation AllocateLargeObject(const object_type &type, size_t count) override {
+            const auto size = type.size * count;
+            return page_allocation{static_cast<std::byte *>(resource->allocate(size, type.alignment)), size};
+        }
+
+        void DeallocateLargeObject(page_allocation allocation, const object_type &type) noexcept override {
+            resource->deallocate(allocation.data(), type.alignment);
+        }
+
+        std::pmr::vector<internal_handle*> CreateLargeObjectsVector() noexcept override {
             return std::pmr::vector<internal_handle*>(resource);
         }
 
@@ -995,7 +1191,31 @@ namespace gc {
                     // where this invariance is not broken
                     // root -> field:
                     // gets added as a field before the root handle is destroyed
-                    --handle->rootHandleCount;
+
+                    // mark handle as garbage if rootHandleCount became 0 and it's not referenced by anything
+                {
+                    // set the garbage flag if possible
+                    bool needsRelease = false; // needs to be in a block because of this variable
+                    if (handle->rootHandleCount == 1) {
+                        handle->objectLock.AcquireRead(); // prevent the object from being collected (if the count becomes 0)
+                        needsRelease = true;
+                    }
+
+                    if (--handle->rootHandleCount == 0) {
+                        if (handle->referencedBy.empty()) {
+                            // there's an assertion that would fail if the object has the flag and the collector cannot
+                            // upgrade the read lock
+                            if (handle->objectLock.TryUpgrade()) {
+                                // if the upgrade fails, the collector is already inspecting this object
+                                handle->flags.SetFlag(object_flags::garbage, true);
+                            }
+                        }
+                    }
+
+                    if (needsRelease) {
+                        handle->objectLock.Release();
+                    }
+                }
                     break;
                 default:
                     break;

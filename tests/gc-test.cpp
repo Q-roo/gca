@@ -125,7 +125,8 @@ private:
 
 struct allocation_failure_test_allocator : gc::gc_allocator {
     simulated_out_of_storage_resource types, pages, pageMemories, ptrSafeContainerNodes,
-                                      lookupNodes, pageAllocations, referencedBy;
+                                      lookupNodes, pageAllocations, referencedBy,
+                                      largeObjectMemory, largeObjects;
 
     allocation_failure_test_allocator(
         const size_t maxTypes = 0,
@@ -134,7 +135,9 @@ struct allocation_failure_test_allocator : gc::gc_allocator {
         const size_t maxPageAllocations = 0,
         const size_t maxObjectNodes = 0, // 1 node contains 64 objects
         const size_t maxObjectLookupNodes = 0, // not specified
-        const size_t maxReferencedBy = 0
+        const size_t maxReferencedBy = 0,
+        const size_t maxLargeObjects = 0,
+        const size_t maxLargeObjectAllocations = 0
     )
 #ifdef _MSC_VER
 #define MAYBE_DEBUG_OVERHEAD(n) (std::is_same_v<std::_Container_base, std::_Container_base12> ? (n) : 0)
@@ -150,7 +153,9 @@ struct allocation_failure_test_allocator : gc::gc_allocator {
     , ptrSafeContainerNodes(maxObjectNodes) // underlying vector uses the new/delete resource for this
     , lookupNodes(maxObjectLookupNodes + std::max(1ULL, maxObjectLookupNodes) * OVERHEAD(2, 2))
     , pageAllocations(maxPageAllocations + std::max(1ULL, maxPageAllocations) * OVERHEAD(1, 0))
-    , referencedBy(maxReferencedBy + std::max(1ULL, maxReferencedBy) * OVERHEAD(1, 0)) {}
+    , referencedBy(maxReferencedBy + std::max(1ULL, maxReferencedBy) * OVERHEAD(1, 0))
+    , largeObjectMemory(maxLargeObjects)
+    , largeObjects(maxLargeObjectAllocations + std::max(1ULL, maxLargeObjectAllocations) * OVERHEAD(1, 0)) {}
 #undef OVERHEAD
 #undef GUARANTEED_OVERHEAD
 #undef MAYBE_DEBUG_OVERHEAD
@@ -161,7 +166,9 @@ struct allocation_failure_test_allocator : gc::gc_allocator {
     , ptrSafeContainerNodes(maxObjectNodes)
     , lookupNodes(maxObjectLookupNodes)
     , pageAllocations(maxPageAllocations)
-    , referencedBy(maxReferencedBy) {}
+    , referencedBy(maxReferencedBy)
+    , largeObjectMemory(maxLargeObjects)
+    , largeObjects(maxLargeObjectAllocations){}
 #endif
 
     std::pmr::vector<gc::object_type> CreateTypesVector() noexcept override {
@@ -190,6 +197,19 @@ struct allocation_failure_test_allocator : gc::gc_allocator {
 
     std::pmr::vector<gc::internal_handle *> CreateReferencedByVectorForHandle() noexcept override {
         return std::pmr::vector<gc::internal_handle *>(&referencedBy);
+    }
+
+    gc::page_allocation AllocateLargeObject(const gc::object_type &type, size_t count) override {
+        const auto size = type.size * count;
+        return gc::page_allocation{static_cast<std::byte *>(largeObjectMemory.allocate(size, type.alignment)), size};
+    }
+
+    void DeallocateLargeObject(gc::page_allocation allocation, const gc::object_type &type) noexcept override {
+        largeObjectMemory.deallocate(allocation.data(), type.alignment);
+    }
+
+    std::pmr::vector<gc::internal_handle*> CreateLargeObjectsVector() noexcept override {
+        return std::pmr::vector<gc::internal_handle*>(&largeObjects);
     }
 
     ~allocation_failure_test_allocator() override = default;
@@ -1213,13 +1233,14 @@ template <class T>
 constexpr gc::object_type default_gc_object_type_v = default_gc_object_type<T>::value;
 
 TEST(GC_collecting_allocator, this_should_work) { // temporary test
+    TerminateOnDeadlockGuard guard{};
     bool success = false;
-    gc::root_handle<int> handle = gc::null_handle;
     EXPECT_NO_THROW(success = gc::Init(gc::gc_init_args{gc::GetDefaultAllocator()}));
+    gc::defer destroy([]{EXPECT_NO_THROW(gc::Destroy());}); // would cause a heap corruption otherwise
+    gc::root_handle<int> handle = gc::null_handle;
     ASSERT_TRUE(success);
     EXPECT_NO_THROW(handle = gc::New<int>());
     EXPECT_NE(handle, gc::null_handle);
-    EXPECT_NO_THROW(gc::Destroy());
 }
 
 TEST(GC_collecting_allocator__page, GetAlignmentCorrection_is_correct) {
