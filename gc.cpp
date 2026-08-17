@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <memory_resource>
 #include <ranges>
-#include <thread>
 
 gc::assertion_failure_handler_fn assertionFailureHandler{[](const std::source_location &location, std::string_view expression, const std::string &message) {
     throw gc::library_bug(std::format(
@@ -157,6 +156,7 @@ namespace gc {
         thread_count id;
         while ((id = gcCount++) >= config::gc_max_collection_thread_count) {
             --gcCount;
+            std::this_thread::yield();
         }
 
         if constexpr (config::enable_debug_messages) {
@@ -416,6 +416,7 @@ namespace gc {
         thread_count id;
         while ((id = gcCount++) >= config::gc_max_collection_thread_count) {
             --gcCount;
+            std::this_thread::yield();
         }
 
         if constexpr (config::enable_debug_messages) {

@@ -127,6 +127,7 @@ namespace gc {
         constexpr static uint8_t all_flags = 0b11111;
     };
 
+    // 64 bytes for a single handle (that is basically the object header)?! how outrageous!
     struct internal_handle {
         page_allocation objectAllocation{};
         std::pmr::vector<internal_handle*> referencedBy{};
@@ -137,7 +138,7 @@ namespace gc {
         // accesses can exist while it is acquired
         type_index objectType{};
         atomic_mark_bitfield markBits{0};
-        rw_lock objectLock{}; // only for field/allocation modifications or for moving object during defragmentation
+        rw_lock objectLock{}; // only for field/allocation (moving object during defragmentation / deallocating) modifications
         atomic_bit_set<object_flags> flags{};
 
         // starting state

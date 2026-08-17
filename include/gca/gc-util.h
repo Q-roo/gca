@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <vector>
 #include <utility>
+#include <thread>
 
 #include "gc-config.h"
 #include "gc-exceptions.h"
@@ -144,6 +145,7 @@ namespace gc {
         constexpr bool ClearMask(const T mask) noexcept {
             auto v = m_Flags.load();
             do {
+                std::this_thread::yield();
                 if (v == (v & mask)) return false;
             }
             while (!m_Flags.compare_exchange_weak(v, v & mask));
@@ -154,6 +156,7 @@ namespace gc {
         constexpr bool EnableMask(const T mask) noexcept {
             auto v = m_Flags.load();
             do {
+                std::this_thread::yield();
                 if (v == (v | mask)) return false;
             }
             while (!m_Flags.compare_exchange_weak(v, v | mask));
@@ -259,13 +262,17 @@ namespace gc {
                 if (TryAcquireWrite()) {
                     return true;
                 }
+
+                std::this_thread::yield();
             }
 
             return false;
         }
 
         void AcquireWrite() noexcept {
-            while (!TryAcquireWrite());
+            while (!TryAcquireWrite()) {
+                std::this_thread::yield();
+            }
         }
 
         bool TryAcquireRead() noexcept {
@@ -279,6 +286,7 @@ namespace gc {
                 if (m_Lock.compare_exchange_weak(v, v + 1)) {
                     return true;
                 }
+                std::this_thread::yield(); // before setting v to stay consistent with AcquireRead
                 v = ClearWriteBit(v);
             }
 
@@ -289,7 +297,10 @@ namespace gc {
             // similar to atomic increment, but ensure that the bit for write access is 0
             for (counter_type v = ClearWriteBit(m_Lock.load());
                  !m_Lock.compare_exchange_weak(v, v + 1);
-                 v = ClearWriteBit(v));
+                 v = ClearWriteBit(v))
+            {
+                std::this_thread::yield();
+            }
         }
 
         bool TryUpgrade() noexcept {
@@ -307,6 +318,8 @@ namespace gc {
                 if (TryUpgrade()) {
                     return true;
                 }
+
+                std::this_thread::yield();
             }
 
             return false;
@@ -318,6 +331,8 @@ namespace gc {
                 if (v == write_mask + 1) {
                     return; // already have write access
                 }
+
+                std::this_thread::yield();
             }
 
             GetAcquiredWriteAccessesOnThisThread().emplace(this);
@@ -341,7 +356,9 @@ namespace gc {
             if (counter_type v = write_mask + 1; !m_Lock.compare_exchange_strong(v, 0)) {
                 // then just simply decrement
                 // without under-flowing
-                while (!m_Lock.compare_exchange_weak(v, v != 0 ? v - 1 : v));
+                while (!m_Lock.compare_exchange_weak(v, v != 0 ? v - 1 : v)) {
+                    std::this_thread::yield();
+                }
             }
 
             GetAcquiredWriteAccessesOnThisThread().erase(this);
@@ -415,7 +432,9 @@ namespace gc {
         }
 
         void Acquire() noexcept {
-            while (!TryAcquire());
+            while (!TryAcquire()) {
+                std::this_thread::yield();
+            }
         }
 
         void Release() noexcept {
